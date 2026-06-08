@@ -1,0 +1,6 @@
+{
+  "name": "Baby Tracker",
+  "description": "Baby application to track child profiles and events.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
