@@ -1,8 +1,0 @@
-{
-  "name": "android-app",
-  "version": "1.0.0",
-  "scripts": {
-    "build": "echo 'Android build success'",
-    "dev": "sleep 1000000"
-  }
-}

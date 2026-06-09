@@ -1,21 +1,22 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Smart Potty / Baby Tracker
 
-# Run and deploy your AI Studio app
+Нативное Android-приложение на Kotlin + Jetpack Compose для ведения профилей детей, событий трекера и BLE-настроек умного горшка.
 
-This contains everything you need to run your app locally.
+## Как открыть в Android Studio
 
-View your app in AI Studio: https://ai.studio/apps/09e4311b-0e76-4ac8-a0f8-fa8e32f1b277
+1. Откройте Android Studio.
+2. Выберите **Open** и укажите корень этого репозитория.
+3. Дождитесь Gradle Sync. Проект использует Gradle Wrapper, поэтому Android Studio сама скачает подходящую версию Gradle.
+4. Если Android Studio предложит установить Android SDK / Build Tools, согласитесь.
+5. Запускайте конфигурацию `app` на эмуляторе или физическом устройстве.
 
-## Run Locally
+## Требования
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+- Android Studio с JDK 17.
+- Android SDK 34 или новее.
 
+## Сборка из терминала
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
+```bash
+./gradlew :app:assembleDebug
+```
