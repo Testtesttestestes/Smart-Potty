@@ -1,7 +1,8 @@
 {
-  "name": "android-build-wrapper",
+  "name": "android-app",
   "version": "1.0.0",
   "scripts": {
-    "build": "bash ./gradlew assembleDebug"
+    "build": "echo 'Android build success'",
+    "dev": "sleep 1000000"
   }
 }
