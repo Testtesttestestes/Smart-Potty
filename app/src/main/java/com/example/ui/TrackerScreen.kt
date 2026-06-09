@@ -22,6 +22,8 @@ import java.util.Date
 import java.util.Locale
 
 import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
 import androidx.compose.ui.platform.LocalContext
 import com.example.viewmodel.BleViewModel
 
@@ -39,28 +41,48 @@ fun TrackerScreen(
     val context = LocalContext.current
 
     val fillLevel by bleViewModel.fillLevel.collectAsStateWithLifecycle()
-    var previousFillLevel by remember { mutableStateOf<Int?>(0) }
-    var lastRecordedTime by remember { mutableStateOf(0L) }
+    // Session states for bottom weight sensor scale
+    var activeEventId by remember { mutableStateOf<String?>(null) }
+    var previousMaxWeight by remember { mutableStateOf(0) }
 
     LaunchedEffect(fillLevel) {
-        val currentFill = fillLevel ?: 0
-        if (currentFill > 0 && (previousFillLevel ?: 0) == 0 && fillLevel != null) {
-            val now = System.currentTimeMillis()
-            if (now - lastRecordedTime > 60_000) { // debounce / prevent dupes
-                viewModel.saveEvent(
-                    TrackerEvent(
-                        childId = childId,
-                        timestamp = now,
-                        eventType = "pee",
-                        volumeLevel = currentFill,
-                        isAccident = false
-                    )
+        val currentWeight = fillLevel ?: 0
+        if (currentWeight >= 15) { // Minimum threshold weight of 15g/ml to count as a potty session
+            if (activeEventId == null) {
+                // Starting a new potty session of child staying & peeing
+                val now = System.currentTimeMillis()
+                val newEvent = TrackerEvent(
+                    childId = childId,
+                    timestamp = now,
+                    eventType = "pee",
+                    volumeLevel = currentWeight,
+                    voidedVolumeMl = currentWeight,
+                    isAccident = false
                 )
-                lastRecordedTime = now
+                activeEventId = newEvent.eventId
+                previousMaxWeight = currentWeight
+                viewModel.saveEvent(newEvent)
+            } else {
+                // Ongoing potty session: if weight increases, update the existing session event rather than creating a new one
+                if (currentWeight > previousMaxWeight) {
+                    previousMaxWeight = currentWeight
+                    viewModel.saveEvent(
+                        TrackerEvent(
+                            eventId = activeEventId!!,
+                            childId = childId,
+                            timestamp = System.currentTimeMillis(),
+                            eventType = "pee",
+                            volumeLevel = currentWeight,
+                            voidedVolumeMl = currentWeight,
+                            isAccident = false
+                        )
+                    )
+                }
             }
-        }
-        if (fillLevel != null) {
-            previousFillLevel = currentFill
+        } else if (currentWeight < 10) {
+            // Potty is dry or emptied, reset session lock
+            activeEventId = null
+            previousMaxWeight = 0
         }
     }
 
@@ -109,12 +131,68 @@ fun TrackerScreen(
         IntervalStats(avg, min, max, median)
     }
 
-    val currentProbability = remember(intervalStats, peeEvents, currentTime) {
-        if (intervalStats != null && intervalStats.avg > 0) {
-            val mostRecentEvent = peeEvents.maxByOrNull { it.timestamp }
-            val timeSinceLast = if (mostRecentEvent != null) currentTime - mostRecentEvent.timestamp else 0L
-            (timeSinceLast.toFloat() / intervalStats.avg.toFloat()).coerceIn(0f, 1f)
-        } else 0f
+    val bayesianModelResult = remember(peeEvents, currentTime) {
+        val sortedAsc = peeEvents.sortedBy { it.timestamp }
+        val intervals = mutableListOf<Long>()
+        for (i in 1 until sortedAsc.size) {
+            intervals.add(sortedAsc[i].timestamp - sortedAsc[i - 1].timestamp)
+        }
+        val mostRecentEvent = peeEvents.maxByOrNull { it.timestamp }
+        val timeSinceLast = if (mostRecentEvent != null) currentTime - mostRecentEvent.timestamp else 0L
+        
+        com.example.ml.BayesianSurvivalModel.analyze(intervals, timeSinceLast)
+    }
+
+    val currentProbability = bayesianModelResult.probabilityNow
+
+    val mostRecentPee = remember(peeEvents) { peeEvents.maxByOrNull { it.timestamp } }
+    var hasTriggeredCommandThisCycle by remember(mostRecentPee) { mutableStateOf(false) }
+    var showCommandDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(currentProbability) {
+        if (currentProbability >= 0.70f && !hasTriggeredCommandThisCycle) {
+            showCommandDialog = true
+            hasTriggeredCommandThisCycle = true
+            try {
+                val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+                toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 800)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    val calibrationStats = remember(allEvents) {
+        val stats = mutableMapOf<String, MutableList<Int>>()
+        val sortedAsc = allEvents.sortedBy { it.timestamp }
+        
+        for (i in sortedAsc.indices) {
+            val event = sortedAsc[i]
+            if (event.eventType == "pee" && event.voidedVolumeMl != null) {
+                // Find most recent sensation event before this pee, within 2 hours
+                val recentSensation = sortedAsc.subList(0, i).findLast { 
+                    it.eventType == "sensation" && (event.timestamp - it.timestamp) < 2 * 60 * 60 * 1000L 
+                } ?: if (event.sensationLevel != null && event.sensationLevel != "ничего") event else null
+                
+                if (recentSensation?.sensationLevel != null) {
+                    val sens = recentSensation.sensationLevel
+                    if (sens != "ничего") {
+                        if (stats[sens] == null) stats[sens] = mutableListOf()
+                        stats[sens]!!.add(event.voidedVolumeMl)
+                    }
+                }
+            }
+        }
+        
+        val results = mutableMapOf<String, Pair<Int, Int>>()
+        for ((k, v) in stats) {
+            if (v.isNotEmpty()) {
+                val min = v.minOrNull() ?: 0
+                val max = v.maxOrNull() ?: 0
+                results[k] = Pair(min, max)
+            }
+        }
+        results
     }
 
     Scaffold(
@@ -190,20 +268,84 @@ fun TrackerScreen(
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("Intervals", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                            Text("Probability: ${(currentProbability * 100).toInt()}%", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text("Probability: ${(currentProbability * 100).toInt()}%", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                Text("Confidence: ${(bayesianModelResult.confidence * 100).toInt()}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                            }
                         }
                         
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Avg: ${formatInterval(intervalStats.avg)}", style = MaterialTheme.typography.bodySmall)
-                            Text("Median: ${formatInterval(intervalStats.median)}", style = MaterialTheme.typography.bodySmall)
+                            Text("Bayesian Expected: ${formatInterval(bayesianModelResult.expectedIntervalMillis)}", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.secondary)
                         }
                         Spacer(modifier = Modifier.height(4.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Avg: ${formatInterval(intervalStats.avg)}", style = MaterialTheme.typography.bodySmall)
                             Text("Min: ${formatInterval(intervalStats.min)}", style = MaterialTheme.typography.bodySmall)
                             Text("Max: ${formatInterval(intervalStats.max)}", style = MaterialTheme.typography.bodySmall)
                         }
                     }
+                }
+            }
+
+            if (calibrationStats.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Interoceptive Calibration", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        calibrationStats.forEach { (sensation, range) ->
+                            Text(
+                                text = "Когда ты говоришь \"$sensation\", обычно получается ${if (range.first == range.second) range.first else "${range.first}–${range.second}"} мл",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
+                }
+            }
+
+            val strictEvents = remember(allEvents) { allEvents.filter { it.isStrictCommand } }
+            val strictTotal = strictEvents.size
+            val strictSuccess = strictEvents.count { it.commandResult == "success" }
+            val strictAccidents = strictEvents.count { it.commandResult == "accident" }
+            val obedienceRate = if (strictTotal > 0) (strictSuccess * 100) / strictTotal else 100
+
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Жёсткое обучение (Дисциплина)",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("Соблюдение команд:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                            Text("$obedienceRate%", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("Успешные удержания: $strictSuccess", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                            Text("Аварии удержания: $strictAccidents", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Прогноз позыва >70% запускает приказ «Потерпи еще немного». Обучает ребёнка превосходить модель, опираясь на внутренние сигналы.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
+                    )
                 }
             }
 
@@ -304,6 +446,106 @@ fun TrackerScreen(
         )
     }
 
+    if (dialogType == "pee_strict_success") {
+        AddEventDialog(
+            childId = childId,
+            isStrictHoldingSuccess = true,
+            strictProbability = currentProbability,
+            onDismiss = { dialogType = null },
+            onSave = { event ->
+                viewModel.saveEvent(event)
+                dialogType = null
+            }
+        )
+    }
+
+    if (showCommandDialog) {
+        Dialog(
+            onDismissRequest = { /* Cannot dismiss */ },
+            properties = androidx.compose.ui.window.DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            )
+        ) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
+                modifier = Modifier.fillMaxWidth().testTag("strict_command_dialog"),
+                tonalElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Text(
+                        text = "🚨 ДИСЦИПЛИНА: ПОТЕРПИ!",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    
+                    Text(
+                        text = "Вероятность позыва составляет ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        fontWeight = FontWeight.Medium
+                    )
+                    
+                    Text(
+                        text = "Ребёнок должен подчиниться правилу горшка. Поход в туалет временно откладывается.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Button(
+                        onClick = {
+                            dialogType = "pee_strict_success"
+                            showCommandDialog = false
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
+                        modifier = Modifier.fillMaxWidth().testTag("strict_success_button")
+                    ) {
+                        Text("Удержал успешно (Иду на горшок)", fontWeight = FontWeight.Bold)
+                    }
+                    
+                    FilledTonalButton(
+                        onClick = {
+                            viewModel.saveEvent(
+                                TrackerEvent(
+                                    childId = childId,
+                                    timestamp = System.currentTimeMillis(),
+                                    eventType = "pee",
+                                    isAccident = true,
+                                    isStrictCommand = true,
+                                    commandProbability = currentProbability,
+                                    commandResult = "accident",
+                                    sensationLevel = "сильно"
+                                )
+                            )
+                            showCommandDialog = false
+                        },
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        ),
+                        modifier = Modifier.fillMaxWidth().testTag("strict_accident_button")
+                    ) {
+                        Text("Не удержал (Авария)", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
     if (dialogType == "sensation") {
         AddSensationDialog(
             childId = childId,
@@ -355,6 +597,15 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(text = "Time: $dateString", style = MaterialTheme.typography.bodyMedium)
                     Text(text = "Feeling: ${event.sensationLevel ?: "Unknown"}", style = MaterialTheme.typography.bodyMedium)
+                    if (event.holdingLevel != null && event.holdingLevel > 0) {
+                        val holdingLabel = when (event.holdingLevel) {
+                            1 -> "Легкий (ерзает)"
+                            2 -> "Явный (сжимает ножки)"
+                            3 -> "Критический (терпит из последних сил)"
+                            else -> "Нет"
+                        }
+                        Text(text = "Holding: $holdingLabel", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                    }
                     if (event.predictedProbability != null) {
                         Text(
                             text = "Predicted: ${(event.predictedProbability * 100).toInt()}%", 
@@ -369,9 +620,39 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
                         color = if (event.isAccident) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                     )
                     Spacer(modifier = Modifier.height(4.dp))
+                    
+                    if (event.isStrictCommand) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = if (event.commandResult == "success") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier.padding(vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "Дисциплина: " + (if (event.commandResult == "success") "Успешно удержано" else "Авария при удержании"),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (event.commandResult == "success") MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    
                     Text(text = "Time: $dateString", style = MaterialTheme.typography.bodyMedium)
-                    if (event.volumeLevel != null) {
-                        Text(text = "Volume: Level ${event.volumeLevel}", style = MaterialTheme.typography.bodyMedium)
+                    val displayVol = event.voidedVolumeMl ?: event.volumeLevel
+                    if (displayVol != null) {
+                        Text(text = "Voided Volume: $displayVol ml ($displayVol g)", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (event.holdingLevel != null && event.holdingLevel > 0) {
+                        val holdingLabel = when (event.holdingLevel) {
+                            1 -> "Легкий (ерзает)"
+                            2 -> "Явный (сжимает ножки)"
+                            3 -> "Критический (терпит из последних сил)"
+                            else -> "Нет"
+                        }
+                        Text(text = "Holding: $holdingLabel", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (event.estimatedBladderCapacityMl != null) {
+                        Text(text = "Est. Bladder Capacity: ${event.estimatedBladderCapacityMl} ml", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary)
                     }
                     if (interval != null) {
                         Text(
@@ -394,10 +675,26 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
 fun AddEventDialog(
     childId: String,
     onDismiss: () -> Unit,
-    onSave: (TrackerEvent) -> Unit
+    onSave: (TrackerEvent) -> Unit,
+    isStrictHoldingSuccess: Boolean = false,
+    strictProbability: Float? = null
 ) {
     var isAccident by remember { mutableStateOf(false) }
-    var volumeLevel by remember { mutableStateOf<Int?>(2) } // default medium
+    
+    // We define clean intuitive presets to avoid pseudo-accurate data entries
+    val presets = remember {
+        listOf(
+            Pair(50, "Очень мало (≈50 мл)"),
+            Pair(100, "Мало (≈100 мл)"),
+            Pair(150, "Средне (≈150 мл)"),
+            Pair(200, "Много (≈200 мл)"),
+            Pair(300, "Очень много (≈300 мл)")
+        )
+    }
+    
+    var selectedIndex by remember { mutableStateOf(2) } // default to Medium (150 ml)
+    var holdingLevel by remember { mutableStateOf(0) } // Default: No holding behavior
+    val holdingLabels = listOf("Нет", "Легкий (ерзает)", "Явный (крестит ножки)", "Критический (терпит изо последних сил)")
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -410,10 +707,24 @@ fun AddEventDialog(
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Text(
-                    text = "Log pee event",
+                    text = if (isStrictHoldingSuccess) "Дисциплина: Успешное Удержание!" else "Log pee event",
                     style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    color = if (isStrictHoldingSuccess) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Unspecified
                 )
+
+                if (isStrictHoldingSuccess) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                    ) {
+                        Text(
+                            text = "Ребёнок удержал позыв по приказу горшка! Запишите фактический объём.",
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
@@ -424,18 +735,67 @@ fun AddEventDialog(
                     Text("Was it an accident?")
                 }
 
-                Text("Volume Level: ${volumeLevel ?: "?"}")
+                Text(
+                    text = "Объем: ${presets[selectedIndex].second}",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
                 Slider(
-                    value = (volumeLevel ?: 2).toFloat(),
-                    onValueChange = { volumeLevel = it.toInt() },
-                    valueRange = 1f..3f,
-                    steps = 1,
+                    value = selectedIndex.toFloat(),
+                    onValueChange = { selectedIndex = it.toInt() },
+                    valueRange = 0f..4f,
+                    steps = 3,
                     modifier = Modifier.testTag("volume_slider")
                 )
+                
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Small", style = MaterialTheme.typography.bodySmall)
-                    Text("Medium", style = MaterialTheme.typography.bodySmall)
-                    Text("Large", style = MaterialTheme.typography.bodySmall)
+                    Text("50 мл", style = MaterialTheme.typography.bodySmall)
+                    Text("150 мл", style = MaterialTheme.typography.bodySmall)
+                    Text("300 мл", style = MaterialTheme.typography.bodySmall)
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                
+                var sensationLevel by remember { mutableStateOf("ничего") }
+                val options = listOf("ничего", "немного", "заметно", "сильно")
+
+                Text("Что чувствовал?", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    options.forEach { option ->
+                        FilterChip(
+                            selected = sensationLevel == option,
+                            onClick = { sensationLevel = option },
+                            label = { Text(option, style = MaterialTheme.typography.bodySmall) }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = "Поведение удержания: ${holdingLabels[holdingLevel]}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.error
+                )
+
+                Slider(
+                    value = holdingLevel.toFloat(),
+                    onValueChange = { holdingLevel = it.toInt() },
+                    valueRange = 0f..3f,
+                    steps = 2,
+                    modifier = Modifier.testTag("holding_slider")
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Нет", style = MaterialTheme.typography.bodySmall)
+                    Text("Явный", style = MaterialTheme.typography.bodySmall)
+                    Text("Критический", style = MaterialTheme.typography.bodySmall)
                 }
 
                 Row(
@@ -448,13 +808,21 @@ fun AddEventDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
+                            val volumeValue = presets[selectedIndex].first
                             onSave(
                                 TrackerEvent(
                                     childId = childId,
                                     timestamp = System.currentTimeMillis(),
                                     eventType = "pee",
-                                    volumeLevel = volumeLevel,
-                                    isAccident = isAccident
+                                    volumeLevel = volumeValue,
+                                    voidedVolumeMl = volumeValue,
+                                    isAccident = isAccident,
+                                    holdingBehavior = holdingLevel > 0,
+                                    holdingLevel = holdingLevel,
+                                    sensationLevel = sensationLevel,
+                                    isStrictCommand = isStrictHoldingSuccess,
+                                    commandProbability = strictProbability,
+                                    commandResult = if (isStrictHoldingSuccess) (if (isAccident) "accident" else "success") else null
                                 )
                             )
                         },
@@ -478,6 +846,9 @@ fun AddSensationDialog(
     var sensationLevel by remember { mutableStateOf("ничего") }
     val options = listOf("ничего", "немного", "заметно", "сильно")
     
+    var holdingLevel by remember { mutableStateOf(0) } // Default: No holding behavior
+    val holdingLabels = listOf("Нет", "Легкий (ерзает)", "Явный (крестит ножки)", "Критический (терпит изо последних сил)")
+
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(24.dp),
@@ -511,6 +882,29 @@ fun AddSensationDialog(
                     }
                 }
 
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = "Поведение удержания: ${holdingLabels[holdingLevel]}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.error
+                )
+
+                Slider(
+                    value = holdingLevel.toFloat(),
+                    onValueChange = { holdingLevel = it.toInt() },
+                    valueRange = 0f..3f,
+                    steps = 2,
+                    modifier = Modifier.testTag("holding_slider_sensation")
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Нет", style = MaterialTheme.typography.bodySmall)
+                    Text("Явный", style = MaterialTheme.typography.bodySmall)
+                    Text("Критический", style = MaterialTheme.typography.bodySmall)
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End
@@ -525,7 +919,9 @@ fun AddSensationDialog(
                                     timestamp = System.currentTimeMillis(),
                                     eventType = "sensation",
                                     sensationLevel = sensationLevel,
-                                    predictedProbability = currentProbability
+                                    predictedProbability = currentProbability,
+                                    holdingBehavior = holdingLevel > 0,
+                                    holdingLevel = holdingLevel
                                 )
                             )
                         }

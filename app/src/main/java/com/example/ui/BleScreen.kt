@@ -125,13 +125,7 @@ fun BleSettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
                                     Text("Battery: $batteryLevel%", style = MaterialTheme.typography.bodyMedium)
                                 }
                                 if (connState == ConnectionState.CONNECTED && fillLevel != null) {
-                                    val levelText = when (fillLevel) {
-                                        0 -> "0: Пусто"
-                                        1 -> "1: Немного"
-                                        2 -> "2: Заметно"
-                                        3 -> "3: Много"
-                                        else -> "Unknown: $fillLevel"
-                                    }
+                                    val levelText = if (fillLevel == 0) "Empty (0 g / 0 ml)" else "$fillLevel ml ($fillLevel g)"
                                     Text("Fill Sensor: $levelText", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Bold)
                                 }
                                 if (connState == ConnectionState.CONNECTING) {
@@ -196,11 +190,17 @@ fun BleSettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
                         }
                         if (connState == ConnectionState.CONNECTED) {
                             Text("Simulate Fill Sensor:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer, modifier = Modifier.padding(top = 16.dp))
-                            Row(modifier = Modifier.fillMaxWidth().padding(top=8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Button(onClick = { viewModel.setSimulatedFillLevel(0) }) { Text("0") }
-                                Button(onClick = { viewModel.setSimulatedFillLevel(1) }) { Text("1") }
-                                Button(onClick = { viewModel.setSimulatedFillLevel(2) }) { Text("2") }
-                                Button(onClick = { viewModel.setSimulatedFillLevel(3) }) { Text("3") }
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(0) }, modifier = Modifier.weight(1f).padding(end = 4.dp)) { Text("0ml") }
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(35) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp)) { Text("35ml") }
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(110) }, modifier = Modifier.weight(1f).padding(start = 4.dp)) { Text("110ml") }
+                                }
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(220) }, modifier = Modifier.weight(1f).padding(end = 4.dp)) { Text("220ml") }
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(380) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp)) { Text("380ml") }
+                                    Button(onClick = { viewModel.setSimulatedFillLevel(450) }, modifier = Modifier.weight(1f).padding(start = 4.dp)) { Text("450ml") }
+                                }
                             }
                         }
                     }
