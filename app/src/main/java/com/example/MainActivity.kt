@@ -9,6 +9,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppDatabase
 import com.example.data.ChildRepository
 import com.example.ui.ChildProfileScreen
+import com.example.ui.SplashScreen
 import com.example.ui.theme.MyApplicationTheme
 import com.example.viewmodel.ChildViewModel
 import com.example.viewmodel.ChildViewModelFactory
@@ -39,7 +40,16 @@ class MainActivity : ComponentActivity() {
       MyApplicationTheme {
         val navController = rememberNavController()
 
-        NavHost(navController = navController, startDestination = "profiles") {
+        NavHost(navController = navController, startDestination = "splash") {
+            composable("splash") {
+                SplashScreen(
+                    onAnimationComplete = {
+                        navController.navigate("profiles") {
+                            popUpTo("splash") { inclusive = true }
+                        }
+                    }
+                )
+            }
             composable("profiles") {
                 val viewModel: ChildViewModel = viewModel(factory = childFactory)
                 ChildProfileScreen(
