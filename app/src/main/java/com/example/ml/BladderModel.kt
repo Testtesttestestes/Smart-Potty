@@ -32,8 +32,16 @@ object BladderModel {
         /** Typical fill rate, ml/min (null without measured volumes). */
         val fillRateMlPerMin: Double?,
         /** Estimated current fill as a fraction of capacity (may exceed 1). */
-        val currentFill: Double?
-    )
+        val currentFill: Double?,
+        /** Growth of the personal capacity, ml per week (bladder stretching / growing). */
+        val capacityGrowthMlPerWeek: Double = 0.0
+    ) {
+        /** Fill expected at [elapsedMin] after a void. */
+        fun fillAfter(elapsedMin: Double): Double? = fillRateMlPerMin?.let { it * elapsedMin / personalCapacityMl }
+    }
+
+    /** Shrinkage of the capacity trend (weeks² pseudo-variance): small samples → no trend. */
+    private const val TREND_SHRINK = 2.0
 
     fun estimate(
         extraction: IntervalExtractor.Result,
@@ -47,11 +55,21 @@ object BladderModel {
                 now - it.timestamp <= WINDOW_MS
         }
         val n = eligible.size
-        val p90 = StatMath.weightedQuantile(
-            eligible.map { it.volumeMl!! },
-            eligible.map { IntervalExtractor.recencyWeight(now - it.timestamp) },
-            0.9
-        )
+        val weights = eligible.map { IntervalExtractor.recencyWeight(now - it.timestamp) }
+        // Local linear trend of log(volume) over weeks: the bladder stretches, so older maxima are
+        // projected to today instead of being averaged with it.
+        val xs = eligible.map { (it.timestamp - now).toDouble() / BayesianSurvivalModel.WEEK_MS }
+        val ys = eligible.map { kotlin.math.ln(it.volumeMl!!) }
+        val slope = if (n >= 3) {
+            val sw = weights.sum()
+            val mx = xs.indices.sumOf { weights[it] * xs[it] } / sw
+            val my = xs.indices.sumOf { weights[it] * ys[it] } / sw
+            val sxy = xs.indices.sumOf { weights[it] * (xs[it] - mx) * (ys[it] - my) }
+            val sxx = xs.indices.sumOf { weights[it] * (xs[it] - mx) * (xs[it] - mx) }
+            sxy / (sxx + TREND_SHRINK)
+        } else 0.0
+        val projected = eligible.indices.map { eligible[it].volumeMl!! * kotlin.math.exp(-slope * xs[it]) }
+        val p90 = StatMath.weightedQuantile(projected, weights, 0.9)
         val capacity = if (p90 == null) ebc else (PRIOR_STRENGTH * ebc + n * p90) / (PRIOR_STRENGTH + n)
 
         val rated = extraction.dayIntervals.filter { it.endVolumeMl != null && it.endVolumeMl > 0 && it.durationMin >= 5 }
@@ -63,6 +81,6 @@ object BladderModel {
 
         val last = extraction.lastVoid
         val fill = if (last != null && rate != null) rate * ((now - last.timestamp) / 60_000.0) / capacity else null
-        return Estimate(ebc, capacity, n, rate, fill)
+        return Estimate(ebc, capacity, n, rate, fill, capacity * (kotlin.math.exp(slope) - 1.0))
     }
 }

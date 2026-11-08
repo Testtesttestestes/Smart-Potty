@@ -1,6 +1,7 @@
 package com.example.ml
 
 import com.example.data.Child
+import com.example.data.EventTypes
 import com.example.data.TrackerEvent
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -9,9 +10,6 @@ import kotlin.math.pow
 
 /** One place that turns the event log into everything the tracker screen shows. */
 object TrackerAnalytics {
-
-    /** Alert ("потерпи") when P(void within the next 5 min | not yet, current signals) reaches this. */
-    const val COMMAND_THRESHOLD = 0.5f
 
     data class Calibration(
         /** Number of back-tested checkpoints. */
@@ -37,15 +35,21 @@ object TrackerAnalytics {
         val signalCoefficients: SignalModel.Coefficients,
         val bladder: BladderModel.Estimate,
         val interoception: InteroceptionMetrics.Result,
+        val success: InteroSuccess.Result,
         val calibration: Calibration,
+        val leaks: List<AccidentModel.LeakResult>,
+        /** Estimated volumes of accidents that were not measured, by event id. */
+        val accidentVolumeEstimates: Map<String, Double>,
+        val staircase: Coaching.Staircase,
+        val decision: Coaching.Decision,
+        val settings: Coaching.Settings,
+        /** End of the currently running "потерпи" countdown, if any. */
+        val activeHoldReleaseTs: Long?,
         val isAsleepNow: Boolean,
         val dayIntervalCount: Int,
         val intakeSinceLastVoidMl: Double,
         val ageMonths: Double?
-    ) {
-        val shouldAlert: Boolean
-            get() = !isAsleepNow && model.hasLastVoid && probNext5 >= COMMAND_THRESHOLD
-    }
+    )
 
     fun ageMonths(birthDate: String?, now: Long, timeZone: TimeZone = TimeZone.getDefault()): Double? {
         if (birthDate.isNullOrBlank()) return null
@@ -58,30 +62,47 @@ object TrackerAnalytics {
         }
     }
 
-    fun learn(events: List<TrackerEvent>, child: Child?, now: Long, timeZone: TimeZone = TimeZone.getDefault()): Learned {
+    private data class Prepared(
+        val age: Double?,
+        /** Events with leaks that emptied the bladder turned into accident voids. */
+        val events: List<TrackerEvent>,
+        val extraction: IntervalExtractor.Result,
+        val leaks: List<AccidentModel.LeakResult>
+    )
+
+    private fun prepare(events: List<TrackerEvent>, child: Child?, now: Long, timeZone: TimeZone): Prepared {
         val age = ageMonths(child?.birthDate, now, timeZone)
-        val extraction = IntervalExtractor.extract(events, child?.sleepSchedule, now, timeZone)
-        val reports = SignalModel.sensationReports(events)
-        val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(extraction.intervals), age)
-        val signal = SignalModel.fit(
-            SignalModel.bins(extraction.intervals, reports, { post.predictive(featuresOf(it)) })
-        )
-        return Learned(signal, backtest(extraction.intervals, reports, age))
+        val ex0 = IntervalExtractor.extract(events, child?.sleepSchedule, now, timeZone)
+        val leaks = if (events.any { it.eventType == EventTypes.LEAK }) {
+            val rate = BladderModel.estimate(ex0, age, now, BayesianSurvivalModel.priorMedianMinutes(age)).fillRateMlPerMin
+            AccidentModel.classifyLeaks(events, ex0, rate)
+        } else emptyList()
+        val effective = AccidentModel.withEmptyingLeaksAsAccidents(events, leaks)
+        val ex = if (effective === events) ex0 else IntervalExtractor.extract(effective, child?.sleepSchedule, now, timeZone)
+        return Prepared(age, effective, ex, leaks)
     }
 
-    private fun featuresOf(iv: IntervalExtractor.Interval) =
-        BayesianSurvivalModel.Features(iv.intakeMl, iv.startsAfterWake)
+    fun learn(events: List<TrackerEvent>, child: Child?, now: Long, timeZone: TimeZone = TimeZone.getDefault()): Learned {
+        val p = prepare(events, child, now, timeZone)
+        val reports = SignalModel.sensationReports(p.events)
+        val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(p.extraction.intervals, now), p.age)
+        val signal = SignalModel.fit(
+            SignalModel.bins(p.extraction.intervals, reports, { post.predictive(BayesianSurvivalModel.featuresOf(it, now)) })
+        )
+        return Learned(signal, backtest(p.extraction.intervals, reports, p.age))
+    }
 
     fun compute(
         events: List<TrackerEvent>,
         child: Child?,
         now: Long,
         timeZone: TimeZone = TimeZone.getDefault(),
-        learned: Learned = learn(events, child, now, timeZone)
+        learned: Learned = learn(events, child, now, timeZone),
+        settings: Coaching.Settings = Coaching.Settings()
     ): Snapshot {
-        val age = ageMonths(child?.birthDate, now, timeZone)
-        val extraction = IntervalExtractor.extract(events, child?.sleepSchedule, now, timeZone)
-        val observations = BayesianSurvivalModel.observationsFrom(extraction.intervals)
+        val p = prepare(events, child, now, timeZone)
+        val extraction = p.extraction
+        val observations = BayesianSurvivalModel.observationsFrom(extraction.intervals, now)
         val last = extraction.lastVoid
         val model = BayesianSurvivalModel.analyze(
             observations,
@@ -89,24 +110,45 @@ object TrackerAnalytics {
             currentFeatures = BayesianSurvivalModel.Features(
                 extraction.intakeSinceLastVoidMl, extraction.lastVoidStartsAfterWake
             ),
-            ageMonths = age
+            ageMonths = p.age
         )
-        val bladder = BladderModel.estimate(extraction, age, now, model.medianIntervalMillis / 60_000.0)
-        val signal = if (last != null) SignalModel.signalAt(SignalModel.sensationReports(events), last.timestamp, now)
+        val bladder = BladderModel.estimate(extraction, p.age, now, model.medianIntervalMillis / 60_000.0)
+        val signal = if (last != null) SignalModel.signalAt(SignalModel.sensationReports(p.events), last.timestamp, now)
             else SignalModel.Signal.NONE
         val p5 = if (last != null) SignalModel.combine(model.probNext5.toDouble(), signal, learned.signal) else 0.0
+
+        val accidentEstimates = p.events
+            .filter { it.eventType == EventTypes.PEE && it.isAccident && it.voidedVolumeMl == null && it.volumeLevel == null }
+            .mapNotNull { e -> AccidentModel.estimateAccidentVolumeMl(e.timestamp, extraction, bladder)?.let { e.eventId to it } }
+            .toMap()
+        val success = InteroSuccess.compute(p.events, extraction, bladder.personalCapacityMl, now, timeZone)
+        val staircase = Coaching.staircase(events, settings)
+        val activeHold = events.filter {
+            it.eventType == EventTypes.COMMAND && (last == null || it.timestamp > last.timestamp)
+        }.maxByOrNull { it.timestamp }?.takeIf { Coaching.holdOutcome(it, events) == Coaching.HoldOutcome.PENDING }
+        val decision = Coaching.decide(
+            settings, p5, signal, extraction.isAsleepNow, last != null, success.recentSuccessRate, staircase, bladder
+        ).let { if (activeHold != null) it.copy(action = Coaching.Action.NONE) else it }
+
         return Snapshot(
             model = model,
             probNext5 = p5.toFloat(),
             currentSignal = signal,
             signalCoefficients = learned.signal,
             bladder = bladder,
-            interoception = InteroceptionMetrics.compute(events, extraction, bladder.personalCapacityMl, now, timeZone),
+            interoception = InteroceptionMetrics.compute(p.events, extraction, bladder.personalCapacityMl, now, timeZone),
+            success = success,
             calibration = learned.calibration,
+            leaks = p.leaks,
+            accidentVolumeEstimates = accidentEstimates,
+            staircase = staircase,
+            decision = decision,
+            settings = settings,
+            activeHoldReleaseTs = activeHold?.let { it.timestamp + (it.holdTargetMin ?: 0) * 60_000L },
             isAsleepNow = extraction.isAsleepNow,
             dayIntervalCount = observations.size,
             intakeSinceLastVoidMl = extraction.intakeSinceLastVoidMl,
-            ageMonths = age
+            ageMonths = p.age
         )
     }
 
@@ -130,10 +172,13 @@ object TrackerAnalytics {
             val historyIntervals = day.subList(0, k).filter { it.endTs <= target.startTs }
                 .map { it.copy(weight = IntervalExtractor.recencyWeight(target.startTs - it.endTs)) }
             if (historyIntervals.size < minHistory) continue
-            val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(historyIntervals), ageMonths)
+            val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(historyIntervals, target.startTs), ageMonths)
             val historyReports = reports.filter { it.timestamp < target.startTs }
-            val coef = SignalModel.fit(SignalModel.bins(historyIntervals, historyReports, { post.predictive(featuresOf(it)) }))
-            val pred = post.predictive(featuresOf(target))
+            val coef = SignalModel.fit(SignalModel.bins(historyIntervals, historyReports, {
+                post.predictive(BayesianSurvivalModel.featuresOf(it, target.startTs))
+            }))
+            // At prediction time the outcome of a later hold command is unknown → heldMin = 0.
+            val pred = post.predictive(BayesianSurvivalModel.featuresOf(target, target.endTs).copy(heldMin = 0.0))
             for (bin in SignalModel.bins(listOf(target), reports, { pred })) {
                 preds.add(SignalModel.combine(bin.baseline, bin.signal, coef) to bin.label)
             }

@@ -7,7 +7,12 @@ import kotlin.math.sqrt
 /**
  * Bayesian survival model for the time between voids.
  *
- * log(interval, min) = β0 + β1·ln(1 + intake/100) + β2·[starts after wake] + ε,  ε ~ N(0, σ²)
+ * log(interval, min) = β0 + β1·ln(1 + intake/100) + β2·[starts after wake]
+ *                      + β3·(weeks from now) + β4·ln(1 + held/10) + ε,  ε ~ N(0, σ²)
+ *
+ * β3 is a local linear trend: the bladder stretches (growth, hold training), so the model
+ * extrapolates the trend instead of only lagging behind it; β0 is the level *now*.
+ * β4 separates intervals lengthened by a "потерпи" command from the natural rhythm.
  *
  * Conjugate Normal-Inverse-Gamma prior → closed-form weighted posterior. The posterior
  * predictive of the next log-interval is Student-t, so small samples get honest heavy tails.
@@ -23,13 +28,25 @@ object BayesianSurvivalModel {
     // worth only 2·A0 = 4 pseudo-observations so the child's own regularity takes over quickly.
     private const val A0 = 2.0
     private const val B0 = 0.15
-    /** Prior means of β1 (fluid intake shortens the interval) and β2. */
+    /** Prior means of β1 (fluid intake shortens the interval) and β4 (holding lengthens it). */
     private const val PRIOR_INTAKE_EFFECT = -0.2
-    /** Prior covariance diagonal, in units of σ² (β0 ≙ 2 pseudo-observations). */
-    private val PRIOR_V_DIAG = doubleArrayOf(0.5, 1.0, 0.5)
+    private const val PRIOR_HOLD_EFFECT = 0.3
+    /** Prior covariance diagonal, in units of σ² (β0 ≙ 2 pseudo-observations; trend ±~10%/week). */
+    private val PRIOR_V_DIAG = doubleArrayOf(0.5, 1.0, 0.5, 0.05, 0.5)
+    const val WEEK_MS = 7L * 24 * 60 * 60_000L
 
-    data class Features(val intakeMl: Double = 0.0, val startsAfterWake: Boolean = false) {
-        fun vector() = doubleArrayOf(1.0, ln(1.0 + intakeMl / 100.0), if (startsAfterWake) 1.0 else 0.0)
+    data class Features(
+        val intakeMl: Double = 0.0,
+        val startsAfterWake: Boolean = false,
+        /** Time of the interval relative to the reference "now", in weeks (≤ 0 for history). */
+        val weeksFromNow: Double = 0.0,
+        /** Minutes held after a "потерпи" command within the interval. */
+        val heldMin: Double = 0.0
+    ) {
+        fun vector() = doubleArrayOf(
+            1.0, ln(1.0 + intakeMl / 100.0), if (startsAfterWake) 1.0 else 0.0,
+            weeksFromNow, ln(1.0 + heldMin / 10.0)
+        )
     }
 
     data class Observation(val durationMin: Double, val features: Features, val weight: Double = 1.0)
@@ -89,8 +106,8 @@ object BayesianSurvivalModel {
     }
 
     fun fit(observations: List<Observation>, ageMonths: Double?): Posterior {
-        val p = 3
-        val m0 = doubleArrayOf(ln(priorMedianMinutes(ageMonths)), PRIOR_INTAKE_EFFECT, 0.0)
+        val p = PRIOR_V_DIAG.size
+        val m0 = doubleArrayOf(ln(priorMedianMinutes(ageMonths)), PRIOR_INTAKE_EFFECT, 0.0, 0.0, PRIOR_HOLD_EFFECT)
         val lambda0 = Array(p) { i -> DoubleArray(p) { j -> if (i == j) 1.0 / PRIOR_V_DIAG[i] else 0.0 } }
 
         val lambdaN = Array(p) { i -> lambda0[i].copyOf() }
@@ -134,9 +151,12 @@ object BayesianSurvivalModel {
         val medianTimeLeftMillis: Long?,
         val confidence: Float,
         val effectiveN: Double,
-        val hasLastVoid: Boolean
-    ) {
-    }
+        val hasLastVoid: Boolean,
+        /** Relative change of the typical interval per week (trend), e.g. 0.05 = +5%/week. */
+        val intervalTrendPerWeek: Double,
+        /** Multiplicative effect of holding 10 minutes after a command on the interval. */
+        val holdEffect: Double
+    )
 
     fun analyze(
         observations: List<Observation>,
@@ -162,12 +182,19 @@ object BayesianSurvivalModel {
             medianTimeLeftMillis = elapsedMin?.let { ms(pred.medianRemainingMinutes(it)) },
             confidence = confidence.toFloat(),
             effectiveN = post.effectiveN,
-            hasLastVoid = elapsedMillis != null
+            hasLastVoid = elapsedMillis != null,
+            intervalTrendPerWeek = exp(post.mean[3]) - 1.0,
+            holdEffect = exp(post.mean[4] * ln(2.0))
         )
     }
 
-    fun observationsFrom(intervals: List<IntervalExtractor.Interval>): List<Observation> =
-        intervals.filter { !it.isNight }.map {
-            Observation(it.durationMin, Features(it.intakeMl, it.startsAfterWake), it.weight)
-        }
+    fun featuresOf(iv: IntervalExtractor.Interval, referenceTs: Long) = Features(
+        intakeMl = iv.intakeMl,
+        startsAfterWake = iv.startsAfterWake,
+        weeksFromNow = (iv.endTs - referenceTs).toDouble() / WEEK_MS,
+        heldMin = iv.heldMin
+    )
+
+    fun observationsFrom(intervals: List<IntervalExtractor.Interval>, referenceTs: Long): List<Observation> =
+        intervals.filter { !it.isNight }.map { Observation(it.durationMin, featuresOf(it, referenceTs), it.weight) }
 }

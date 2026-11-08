@@ -35,7 +35,9 @@ object IntervalExtractor {
         /** The interval starts with the first void after waking up. */
         val startsAfterWake: Boolean,
         val isNight: Boolean,
-        val weight: Double
+        val weight: Double,
+        /** Minutes held after a "потерпи" command inside this interval (0 if none). */
+        val heldMin: Double = 0.0
     ) {
         val durationMs: Long get() = endTs - startTs
         val durationMin: Double get() = durationMs / 60_000.0
@@ -98,6 +100,9 @@ object IntervalExtractor {
         fun intakeBetween(from: Long, to: Long): Double =
             drinks.filter { it.timestamp >= from && it.timestamp < to }.sumOf { it.fluidIntakeMl!!.toDouble() }
         fun overlapsSleep(from: Long, to: Long) = periods.any { it.start < to && it.end > from }
+        val commands = sorted.filter { it.eventType == EventTypes.COMMAND }
+        fun heldIn(from: Long, to: Long): Double =
+            commands.lastOrNull { it.timestamp > from && it.timestamp < to }?.let { (to - it.timestamp) / 60_000.0 } ?: 0.0
 
         // 3. Intervals.
         val voids = merged.toMutableList()
@@ -118,7 +123,8 @@ object IntervalExtractor {
                     intakeMl = intakeBetween(a.timestamp, b.timestamp),
                     startsAfterWake = nextStartsAfterWake,
                     isNight = night,
-                    weight = recencyWeight(now - b.timestamp)
+                    weight = recencyWeight(now - b.timestamp),
+                    heldMin = heldIn(a.timestamp, b.timestamp)
                 )
             )
             nextStartsAfterWake = night

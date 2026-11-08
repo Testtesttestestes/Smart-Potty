@@ -4,12 +4,15 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.ChildRepository
+import com.example.data.CoachingSettingsRepository
 import com.example.data.TrackerEvent
 import com.example.data.TrackerEventRepository
+import com.example.ml.Coaching
 import com.example.ml.TrackerAnalytics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -18,8 +21,14 @@ import kotlinx.coroutines.launch
 
 class TrackerEventViewModel(
     private val repository: TrackerEventRepository,
-    private val childRepository: ChildRepository
+    private val childRepository: ChildRepository,
+    private val settingsRepository: CoachingSettingsRepository
 ) : ViewModel() {
+
+    fun coachingSettings(childId: String): StateFlow<Coaching.Settings> = settingsRepository.settings(childId)
+
+    fun updateCoachingSettings(childId: String, settings: Coaching.Settings) =
+        settingsRepository.update(childId, settings)
 
     fun getEventsForChild(childId: String): Flow<List<TrackerEvent>> {
         return repository.getEventsForChild(childId)
@@ -40,8 +49,8 @@ class TrackerEventViewModel(
         val learned = data.map { (events, child) ->
             Triple(events, child, TrackerAnalytics.learn(events, child, System.currentTimeMillis()))
         }
-        return combine(learned, ticker) { (events, child, learnedPart), _ ->
-            TrackerAnalytics.compute(events, child, System.currentTimeMillis(), learned = learnedPart)
+        return combine(learned, settingsRepository.settings(childId), ticker) { (events, child, learnedPart), settings, _ ->
+            TrackerAnalytics.compute(events, child, System.currentTimeMillis(), learned = learnedPart, settings = settings)
         }.flowOn(Dispatchers.Default)
     }
 
@@ -60,12 +69,13 @@ class TrackerEventViewModel(
 
 class TrackerEventViewModelFactory(
     private val repository: TrackerEventRepository,
-    private val childRepository: ChildRepository
+    private val childRepository: ChildRepository,
+    private val settingsRepository: CoachingSettingsRepository
 ) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(TrackerEventViewModel::class.java)) {
             @Suppress("UNCHECKED_CAST")
-            return TrackerEventViewModel(repository, childRepository) as T
+            return TrackerEventViewModel(repository, childRepository, settingsRepository) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }

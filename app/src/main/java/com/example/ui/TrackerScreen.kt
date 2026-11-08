@@ -16,9 +16,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.EventTypes
+import com.example.data.FlowPatterns
+import com.example.data.Initiators
 import com.example.data.TrackerEvent
 import com.example.ml.BayesianSurvivalModel
+import com.example.ml.AccidentModel
 import com.example.ml.BladderModel
+import com.example.ml.Coaching
+import com.example.ml.InteroSuccess
+import com.example.ml.UroflowAnalyzer
 import com.example.ml.InteroceptionMetrics
 import com.example.ml.SignalModel
 import com.example.ml.TrackerAnalytics
@@ -69,41 +75,60 @@ fun TrackerScreen(
     }
 
     val fillLevel by bleViewModel.fillLevel.collectAsStateWithLifecycle()
-    // Session state for the bottom weight sensor scale
+    // Session state for the potty scale: timestamped readings feed the uroflow analysis.
     var activeEvent by remember { mutableStateOf<TrackerEvent?>(null) }
     var previousMaxWeight by remember { mutableStateOf(0) }
+    val sessionSamples = remember { mutableListOf<UroflowAnalyzer.Sample>() }
+    val preBuffer = remember { ArrayDeque<UroflowAnalyzer.Sample>() }
 
     LaunchedEffect(fillLevel) {
         val currentWeight = fillLevel ?: 0
+        val now = System.currentTimeMillis()
+        val sample = UroflowAnalyzer.Sample(now, currentWeight.toDouble())
         if (currentWeight >= 15) { // Minimum threshold weight of 15 g to count as a potty session
             val active = activeEvent
             if (active == null) {
-                // Starting a new potty session
+                // Starting a new potty session; keep the readings just before it to catch the stream start.
+                sessionSamples.clear()
+                sessionSamples.addAll(preBuffer)
+                sessionSamples.add(sample)
+                val flow = UroflowAnalyzer.analyze(sessionSamples)
                 val newEvent = TrackerEvent(
                     childId = childId,
-                    timestamp = System.currentTimeMillis(),
+                    timestamp = flow?.streamStartMs ?: now,
                     eventType = EventTypes.PEE,
                     volumeLevel = currentWeight, // raw grams from the scale
                     voidedVolumeMl = BladderModel.gramsToMl(currentWeight),
-                    isAccident = false
+                    isAccident = false,
+                    source = "potty"
                 )
                 activeEvent = newEvent
                 previousMaxWeight = currentWeight
                 save(newEvent)
-            } else if (currentWeight > previousMaxWeight) {
-                // Ongoing session: update the volume only, keep the session start time and other fields
-                previousMaxWeight = currentWeight
-                val updated = active.copy(
-                    volumeLevel = currentWeight,
-                    voidedVolumeMl = BladderModel.gramsToMl(currentWeight)
-                )
-                activeEvent = updated
-                save(updated)
+            } else {
+                sessionSamples.add(sample)
+                if (currentWeight > previousMaxWeight) {
+                    // Ongoing session: update volume and flow summary, keep the start time and other fields
+                    previousMaxWeight = currentWeight
+                    val flow = UroflowAnalyzer.analyze(sessionSamples)
+                    val updated = active.copy(
+                        volumeLevel = currentWeight,
+                        voidedVolumeMl = BladderModel.gramsToMl(currentWeight),
+                        flowMaxMlPerSec = flow?.maxFlowMlPerSec?.toFloat(),
+                        flowPattern = flow?.pattern
+                    )
+                    activeEvent = updated
+                    save(updated)
+                }
             }
-        } else if (currentWeight < 10) {
-            // Potty is dry or emptied, reset session lock
-            activeEvent = null
-            previousMaxWeight = 0
+        } else {
+            preBuffer.addLast(sample)
+            while (preBuffer.isNotEmpty() && now - preBuffer.first().timestampMs > 5_000) preBuffer.removeFirst()
+            if (currentWeight < 10) {
+                // Potty is dry or emptied, reset session lock
+                activeEvent = null
+                previousMaxWeight = 0
+            }
         }
     }
 
@@ -112,7 +137,7 @@ fun TrackerScreen(
     val filteredEvents = remember(allEvents, filterType) {
         when (filterType) {
             "Successful" -> allEvents.filter { it.eventType == EventTypes.PEE && !it.isAccident }
-            "Accidents" -> allEvents.filter { it.eventType == EventTypes.PEE && it.isAccident }
+            "Accidents" -> allEvents.filter { (it.eventType == EventTypes.PEE && it.isAccident) || it.eventType == EventTypes.LEAK }
             "Sensations" -> allEvents.filter { it.eventType == EventTypes.SENSATION }
             else -> allEvents
         }
@@ -123,20 +148,67 @@ fun TrackerScreen(
     val accidentCount = peeEvents.count { it.isAccident }
 
     val mostRecentPee = remember(peeEvents) { peeEvents.maxByOrNull { it.timestamp } }
-    var hasTriggeredCommandThisCycle by remember(mostRecentPee) { mutableStateOf(false) }
-    var showCommandDialog by remember { mutableStateOf(false) }
+    val coachingSettings by viewModel.coachingSettings(childId).collectAsStateWithLifecycle()
+    fun beep() {
+        try {
+            ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100).startTone(ToneGenerator.TONE_PROP_BEEP, 800)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
 
-    val shouldAlert = analytics?.shouldAlert == true
-    LaunchedEffect(shouldAlert, mostRecentPee) {
-        if (shouldAlert && !hasTriggeredCommandThisCycle) {
-            showCommandDialog = true
-            hasTriggeredCommandThisCycle = true
-            try {
-                val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-                toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 800)
-            } catch (e: Exception) {
-                e.printStackTrace()
+    // At most one prompt/command per interval (keyed by the last void).
+    var handledForVoid by remember { mutableStateOf<Long?>(null) }
+    var coachDialog by remember { mutableStateOf<String?>(null) } // "go", "hold", "release", "feedback"
+    var holdDialogMin by remember { mutableStateOf(0) }
+    val decision = analytics?.decision
+    val lastVoidTs = mostRecentPee?.timestamp
+    LaunchedEffect(decision?.action, lastVoidTs) {
+        val action = decision?.action ?: return@LaunchedEffect
+        if (action == Coaching.Action.NONE || handledForVoid == lastVoidTs) return@LaunchedEffect
+        handledForVoid = lastVoidTs
+        val now = System.currentTimeMillis()
+        when (action) {
+            Coaching.Action.PROMPT_GO -> {
+                save(TrackerEvent(childId = childId, timestamp = now, eventType = EventTypes.PROMPT, predictedProbability = currentProbability))
+                coachDialog = "go"
             }
+            Coaching.Action.COMMAND_HOLD -> {
+                val minutes = decision.holdTargetMin ?: 1
+                save(
+                    TrackerEvent(
+                        childId = childId, timestamp = now, eventType = EventTypes.COMMAND,
+                        holdTargetMin = minutes, commandProbability = currentProbability
+                    )
+                )
+                holdDialogMin = minutes
+                coachDialog = "hold"
+            }
+            Coaching.Action.NONE -> {}
+        }
+        beep()
+    }
+
+    // End of a hold countdown: tell the child they may go now.
+    val releaseTs = analytics?.activeHoldReleaseTs
+    LaunchedEffect(releaseTs) {
+        val ts = releaseTs ?: return@LaunchedEffect
+        val wait = ts - System.currentTimeMillis()
+        if (wait < -10 * 60_000L) return@LaunchedEffect // long past (screen reopened later)
+        if (wait > 0) kotlinx.coroutines.delay(wait)
+        coachDialog = "release"
+        beep()
+    }
+
+    // Feedback *after* a void, never before: "ты почувствовал вовремя!".
+    val latestScore = analytics?.success?.scores?.maxByOrNull { it.timestamp }
+    var feedbackShownFor by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(latestScore?.eventId, latestScore?.success) {
+        val score = latestScore ?: return@LaunchedEffect
+        val fresh = System.currentTimeMillis() - score.timestamp < 10 * 60_000L
+        if (score.success && fresh && feedbackShownFor != score.eventId) {
+            feedbackShownFor = score.eventId
+            coachDialog = "feedback"
         }
     }
 
@@ -197,49 +269,14 @@ fun TrackerScreen(
 
             analytics?.let { snapshot ->
                 ForecastCard(snapshot)
+                SuccessCard(snapshot)
                 InteroceptionCard(snapshot.interoception)
             }
 
-            val strictEvents = remember(allEvents) { allEvents.filter { it.isStrictCommand } }
-            val strictTotal = strictEvents.size
-            val strictSuccess = strictEvents.count { it.commandResult == "success" }
-            val strictAccidents = strictEvents.count { it.commandResult == "accident" }
-            val obedienceRate = if (strictTotal > 0) (strictSuccess * 100) / strictTotal else 100
-
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "Жёсткое обучение (Дисциплина)",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column {
-                            Text("Соблюдение команд:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
-                            Text("$obedienceRate%", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text("Успешные удержания: $strictSuccess", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
-                            Text("Аварии удержания: $strictAccidents", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                        }
-                    }
-                    
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Вероятность позыва в ближайшие 5 минут ≥${(TrackerAnalytics.COMMAND_THRESHOLD * 100).toInt()}% (время + свежие ощущения и поведение удержания) запускает приказ «Потерпи еще немного». Во время сна приказ не срабатывает.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
-                    )
-                }
+            analytics?.let { snapshot ->
+                CoachingCard(snapshot, onModeChange = { mode ->
+                    viewModel.updateCoachingSettings(childId, coachingSettings.copy(mode = mode))
+                })
             }
 
             // Filters
@@ -302,6 +339,7 @@ fun TrackerScreen(
                         EventCard(
                             event = event,
                             interval = interval,
+                            details = eventDetails(event, analytics),
                             onDelete = { viewModel.deleteEvent(event.eventId) }
                         )
                     }
@@ -324,6 +362,24 @@ fun TrackerScreen(
                     }
                     TextButton(onClick = { dialogType = "drink" }, modifier = Modifier.fillMaxWidth()) {
                         Text("Питьё")
+                    }
+                    TextButton(
+                        onClick = {
+                            save(TrackerEvent(childId = childId, timestamp = System.currentTimeMillis(), eventType = EventTypes.LEAK, source = "manual"))
+                            dialogType = null
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("leak_button")
+                    ) {
+                        Text("Протечка (капли, не авария)")
+                    }
+                    TextButton(
+                        onClick = {
+                            save(TrackerEvent(childId = childId, timestamp = System.currentTimeMillis(), eventType = EventTypes.SIT, source = "manual"))
+                            dialogType = null
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("sit_button")
+                    ) {
+                        Text("Сел на горшок")
                     }
                     val asleep = analytics?.isAsleepNow == true
                     TextButton(
@@ -358,104 +414,32 @@ fun TrackerScreen(
         )
     }
 
-    if (dialogType == "pee_strict_success") {
-        AddEventDialog(
-            childId = childId,
-            isStrictHoldingSuccess = true,
-            strictProbability = currentProbability,
-            onDismiss = { dialogType = null },
-            onSave = { event ->
-                save(event)
-                dialogType = null
+    when (coachDialog) {
+        "go" -> CoachDialog(
+            title = "Пора на горшок",
+            text = "Похоже, скоро захочется. Сходим?",
+            onDismiss = { coachDialog = null }
+        )
+        "hold" -> CoachDialog(
+            title = "Потерпи $holdDialogMin мин",
+            text = "Прислушайся к животику. Через $holdDialogMin мин можно будет пойти.",
+            onDismiss = { coachDialog = null },
+            secondaryLabel = "Не дотерпел (авария)",
+            onSecondary = {
+                save(TrackerEvent(childId = childId, timestamp = System.currentTimeMillis(), eventType = EventTypes.PEE, isAccident = true, source = "manual"))
+                coachDialog = null
             }
         )
-    }
-
-    if (showCommandDialog) {
-        Dialog(
-            onDismissRequest = { /* Cannot dismiss */ },
-            properties = androidx.compose.ui.window.DialogProperties(
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false
-            )
-        ) {
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.errorContainer,
-                modifier = Modifier.fillMaxWidth().testTag("strict_command_dialog"),
-                tonalElevation = 8.dp
-            ) {
-                Column(
-                    modifier = Modifier.padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    Text(
-                        text = "🚨 ДИСЦИПЛИНА: ПОТЕРПИ!",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                    )
-                    
-                    Text(
-                        text = "Вероятность позыва в ближайшие 5 минут — ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        fontWeight = FontWeight.Medium
-                    )
-                    
-                    Text(
-                        text = "Ребёнок должен подчиниться правилу горшка. Поход в туалет временно откладывается.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                    )
-                    
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    Button(
-                        onClick = {
-                            dialogType = "pee_strict_success"
-                            showCommandDialog = false
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary
-                        ),
-                        modifier = Modifier.fillMaxWidth().testTag("strict_success_button")
-                    ) {
-                        Text("Удержал успешно (Иду на горшок)", fontWeight = FontWeight.Bold)
-                    }
-                    
-                    FilledTonalButton(
-                        onClick = {
-                            save(
-                                TrackerEvent(
-                                    childId = childId,
-                                    timestamp = System.currentTimeMillis(),
-                                    eventType = EventTypes.PEE,
-                                    isAccident = true,
-                                    isStrictCommand = true,
-                                    commandProbability = currentProbability,
-                                    commandResult = "accident",
-                                    sensationLevel = "сильно"
-                                )
-                            )
-                            showCommandDialog = false
-                        },
-                        colors = ButtonDefaults.filledTonalButtonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError
-                        ),
-                        modifier = Modifier.fillMaxWidth().testTag("strict_accident_button")
-                    ) {
-                        Text("Не удержал (Авария)", fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
+        "release" -> CoachDialog(
+            title = "Молодец! Теперь можно",
+            text = "Теперь можно идти на горшок.",
+            onDismiss = { coachDialog = null }
+        )
+        "feedback" -> CoachDialog(
+            title = "Ты почувствовал вовремя! 🎉",
+            text = "Сам пошёл, и пузырь был полный — именно так.",
+            onDismiss = { coachDialog = null }
+        )
     }
 
     if (dialogType == "drink") {
@@ -491,7 +475,7 @@ fun formatInterval(millis: Long): String {
 
 
 @Composable
-fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
+fun EventCard(event: TrackerEvent, interval: String?, details: List<String> = emptyList(), onDelete: () -> Unit) {
     val format = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
     val dateString = format.format(Date(event.timestamp))
 
@@ -504,18 +488,27 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                if (event.eventType == EventTypes.DRINK || event.eventType == EventTypes.SLEEP || event.eventType == EventTypes.WAKE) {
+                if (event.eventType in listOf(
+                        EventTypes.DRINK, EventTypes.SLEEP, EventTypes.WAKE,
+                        EventTypes.LEAK, EventTypes.SIT, EventTypes.PROMPT, EventTypes.COMMAND
+                    )
+                ) {
                     Text(
                         text = when (event.eventType) {
                             EventTypes.DRINK -> "Питьё: ${event.fluidIntakeMl ?: "?"} мл"
                             EventTypes.SLEEP -> "Уснул"
-                            else -> "Проснулся"
+                            EventTypes.WAKE -> "Проснулся"
+                            EventTypes.LEAK -> "Протечка"
+                            EventTypes.SIT -> "Сел на горшок"
+                            EventTypes.PROMPT -> "Подсказка «пора»"
+                            else -> "Потерпи ${event.holdTargetMin ?: "?"} мин"
                         },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.tertiary
                     )
                     Text(text = "Time: $dateString", style = MaterialTheme.typography.bodyMedium)
+                    details.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
                 } else if (event.eventType == EventTypes.SENSATION) {
                     Text(
                         text = "Sensation Log",
@@ -583,6 +576,7 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
                     if (event.estimatedBladderCapacityMl != null) {
                         Text(text = "Est. Bladder Capacity: ${event.estimatedBladderCapacityMl} ml", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary)
                     }
+                    details.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary) }
                     if (interval != null) {
                         Text(
                             text = "Time since previous: $interval", 
@@ -604,11 +598,10 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
 fun AddEventDialog(
     childId: String,
     onDismiss: () -> Unit,
-    onSave: (TrackerEvent) -> Unit,
-    isStrictHoldingSuccess: Boolean = false,
-    strictProbability: Float? = null
+    onSave: (TrackerEvent) -> Unit
 ) {
     var isAccident by remember { mutableStateOf(false) }
+    var initiator by remember { mutableStateOf(Initiators.CHILD) }
     
     // We define clean intuitive presets to avoid pseudo-accurate data entries
     val presets = remember {
@@ -636,23 +629,15 @@ fun AddEventDialog(
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Text(
-                    text = if (isStrictHoldingSuccess) "Дисциплина: Успешное Удержание!" else "Log pee event",
+                    text = "Log pee event",
                     style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isStrictHoldingSuccess) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Unspecified
+                    fontWeight = FontWeight.Bold
                 )
 
-                if (isStrictHoldingSuccess) {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                    ) {
-                        Text(
-                            text = "Ребёнок удержал позыв по приказу горшка! Запишите фактический объём.",
-                            modifier = Modifier.padding(12.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                        )
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Кто начал:", style = MaterialTheme.typography.bodyMedium)
+                    FilterChip(selected = initiator == Initiators.CHILD, onClick = { initiator = Initiators.CHILD }, label = { Text("Сам") })
+                    FilterChip(selected = initiator == Initiators.PARENT, onClick = { initiator = Initiators.PARENT }, label = { Text("Напомнили") })
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -661,7 +646,7 @@ fun AddEventDialog(
                         onCheckedChange = { isAccident = it },
                         modifier = Modifier.testTag("accident_checkbox")
                     )
-                    Text("Was it an accident?")
+                    Text(if (isAccident) "Авария (объём оценит модель)" else "Was it an accident?")
                 }
 
                 Text(
@@ -743,15 +728,15 @@ fun AddEventDialog(
                                     childId = childId,
                                     timestamp = System.currentTimeMillis(),
                                     eventType = EventTypes.PEE,
-                                    volumeLevel = volumeValue,
-                                    voidedVolumeMl = volumeValue,
+                                    // An accident's volume is not measured: the model estimates it.
+                                    volumeLevel = if (isAccident) null else volumeValue,
+                                    voidedVolumeMl = if (isAccident) null else volumeValue,
                                     isAccident = isAccident,
                                     holdingBehavior = holdingLevel > 0,
                                     holdingLevel = holdingLevel,
                                     sensationLevel = sensationLevel,
-                                    isStrictCommand = isStrictHoldingSuccess,
-                                    commandProbability = strictProbability,
-                                    commandResult = if (isStrictHoldingSuccess) (if (isAccident) "accident" else "success") else null
+                                    initiator = initiator,
+                                    source = "manual"
                                 )
                             )
                         },
@@ -1006,14 +991,157 @@ fun eventsToCsv(events: List<TrackerEvent>): String {
     val header = listOf(
         "time", "timestamp_ms", "event_type", "voided_volume_ml", "raw_weight_g", "is_accident",
         "sensation", "holding_level", "fluid_intake_ml", "predicted_probability", "estimated_capacity_ml",
-        "strict_command", "command_probability", "command_result", "model_version"
+        "strict_command", "command_probability", "command_result", "model_version",
+        "initiator", "hold_target_min", "latency_ms", "flow_max_ml_s", "flow_pattern", "volume_estimated", "source"
     ).joinToString(",")
     val rows = events.sortedBy { it.timestamp }.map { e ->
         listOf(
             iso.format(Date(e.timestamp)), e.timestamp, e.eventType, e.voidedVolumeMl, e.volumeLevel, e.isAccident,
             e.sensationLevel, e.holdingLevel, e.fluidIntakeMl, e.predictedProbability, e.estimatedBladderCapacityMl,
-            e.isStrictCommand, e.commandProbability, e.commandResult, e.modelVersion
+            e.isStrictCommand, e.commandProbability, e.commandResult, e.modelVersion,
+            e.initiator, e.holdTargetMin, e.latencyMs, e.flowMaxMlPerSec, e.flowPattern, e.volumeEstimated, e.source
         ).joinToString(",") { q(it) }
     }
     return (listOf(header) + rows).joinToString("\n")
+}
+
+/** Extra per-event lines derived from analytics (initiator, latency, flow, estimates, leak verdict). */
+fun eventDetails(event: TrackerEvent, snapshot: TrackerAnalytics.Snapshot?): List<String> {
+    val out = mutableListOf<String>()
+    when (event.eventType) {
+        EventTypes.PEE -> {
+            val score = snapshot?.success?.scores?.firstOrNull { it.eventId == event.eventId }
+            if (score != null) {
+                out.add(if (score.initiator == Initiators.CHILD) "Пошёл сам" else if (score.initiator == Initiators.APP) "По подсказке приложения" else "Напомнили")
+                score.fill?.let { out.add("Пузырь был заполнен ≈ ${(it * 100).roundToInt()}%") }
+                score.latencyMs?.let { out.add("От посадки до потока: ${it / 1000} с") }
+                if (score.success) out.add("✓ Интероцептивный успех")
+            }
+            when (event.flowPattern) {
+                FlowPatterns.BELL -> out.add("Поток ровный" + (event.flowMaxMlPerSec?.let { ", пик ${"%.1f".format(it)} мл/с" } ?: ""))
+                FlowPatterns.INTERRUPTED -> out.add("Поток прерывистый — был напряжён/стеснялся")
+            }
+            snapshot?.accidentVolumeEstimates?.get(event.eventId)?.let { out.add("Объём (оценка модели): ≈ ${it.roundToInt()} мл") }
+            if (event.volumeEstimated) out.add("Протечка оказалась аварией (по следующему объёму)")
+        }
+        EventTypes.LEAK -> {
+            when (snapshot?.leaks?.firstOrNull { it.eventId == event.eventId }?.verdict) {
+                AccidentModel.LeakVerdict.LEAK -> out.add("Подтверждено: пузырь не опорожнился")
+                AccidentModel.LeakVerdict.EMPTIED -> out.add("Похоже, это была авария: следующий объём слишком мал")
+                else -> out.add("Проверится при следующем походе на горшок")
+            }
+        }
+        EventTypes.COMMAND -> {
+            val trial = snapshot?.staircase?.trials?.firstOrNull { it.commandTs == event.timestamp }
+            out.add(
+                when (trial?.outcome) {
+                    Coaching.HoldOutcome.SUCCESS -> "Дотерпел ✓"
+                    Coaching.HoldOutcome.FAILED_ACCIDENT -> "Авария/протечка до конца"
+                    Coaching.HoldOutcome.FAILED_EARLY -> "Пошёл раньше времени"
+                    else -> "Идёт…"
+                }
+            )
+        }
+    }
+    return out
+}
+
+@Composable
+fun CoachDialog(
+    title: String,
+    text: String,
+    onDismiss: () -> Unit,
+    secondaryLabel: String? = null,
+    onSecondary: (() -> Unit)? = null
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title, fontWeight = FontWeight.Bold) },
+        text = { Text(text) },
+        confirmButton = { Button(onClick = onDismiss, modifier = Modifier.testTag("coach_ok_button")) { Text("OK") } },
+        dismissButton = if (secondaryLabel != null && onSecondary != null) {
+            { TextButton(onClick = onSecondary) { Text(secondaryLabel, color = MaterialTheme.colorScheme.error) } }
+        } else null
+    )
+}
+
+@Composable
+fun CoachingCard(snapshot: TrackerAnalytics.Snapshot, onModeChange: (Coaching.Mode) -> Unit) {
+    val mode = snapshot.settings.mode
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("coaching_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            val onColor = MaterialTheme.colorScheme.onTertiaryContainer
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(selected = mode == Coaching.Mode.QUIET, onClick = { onModeChange(Coaching.Mode.QUIET) }, label = { Text("Тихо") })
+                FilterChip(selected = mode == Coaching.Mode.SAFETY, onClick = { onModeChange(Coaching.Mode.SAFETY) }, label = { Text("Страховка") })
+                FilterChip(selected = mode == Coaching.Mode.HOLD_TRAINING, onClick = { onModeChange(Coaching.Mode.HOLD_TRAINING) }, label = { Text("Тренировка") })
+            }
+            Text(
+                when (mode) {
+                    Coaching.Mode.QUIET -> "Приложение молчит и только измеряет — ребёнок учится слушать тело сам."
+                    Coaching.Mode.SAFETY -> "Подсказка только перед вероятной аварией (порог ${pct(snapshot.decision.safetyThreshold)}; растёт с успехами ребёнка)."
+                    Coaching.Mode.HOLD_TRAINING -> "«Потерпи» при сильном позыве: сейчас ${snapshot.decision.holdTargetMin ?: snapshot.staircase.nextTargetMin} мин " +
+                        "(лестница: +${snapshot.settings.stepMin} мин после 3 успехов подряд, −${snapshot.settings.stepMin} после неудачи)."
+                },
+                style = MaterialTheme.typography.bodySmall, color = onColor
+            )
+            if (mode == Coaching.Mode.HOLD_TRAINING) {
+                val done = snapshot.staircase.trials.count { it.outcome != Coaching.HoldOutcome.PENDING }
+                Text(
+                    "Удержаний: $done, успешных за последние 10: ${pct(snapshot.staircase.recentSuccessRate)}",
+                    style = MaterialTheme.typography.bodySmall, color = onColor
+                )
+            }
+            snapshot.activeHoldReleaseTs?.let { release ->
+                val left = ((release - System.currentTimeMillis()) / 60_000.0).coerceAtLeast(0.0)
+                Text("Идёт «потерпи»: осталось ≈ ${"%.0f".format(kotlin.math.ceil(left))} мин", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = onColor)
+            }
+        }
+    }
+}
+
+@Composable
+fun SuccessCard(snapshot: TrackerAnalytics.Snapshot) {
+    val r = snapshot.success
+    if (r.scores.isEmpty() && r.weeks.isEmpty()) return
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("success_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            val onColor = MaterialTheme.colorScheme.onPrimaryContainer
+            Text("Интероцептивный успех", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = onColor)
+            Text(
+                "За 14 дней: ${pct(r.recentSuccessRate)} походов — сам, вовремя, с полным пузырём (≥${(InteroSuccess.MIN_FILL * 100).toInt()}%)",
+                style = MaterialTheme.typography.bodySmall, color = onColor
+            )
+            val weeks = r.weeks.takeLast(4)
+            if (weeks.isNotEmpty()) {
+                Text(
+                    "По неделям: " + weeks.joinToString(" → ") { pct(it.successRate) } +
+                        (weeks.last().let { " (аварий ${it.accidents}, протечек ${it.leaks}, рано сел ${it.earlySits})" }),
+                    style = MaterialTheme.typography.bodySmall, color = onColor
+                )
+            }
+            r.latencyNorm?.let {
+                Text("Обычно поток через ${it.medianMs / 1000} с после посадки (n=${it.n})", style = MaterialTheme.typography.bodySmall, color = onColor)
+            }
+            if (r.difficultyRelaxing) {
+                Text("Даже с полным пузырём долго не начинается — похоже, трудно расслабиться (не ошибка интероцепции)",
+                    style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = onColor)
+            }
+            val b = snapshot.bladder
+            val trend = snapshot.model.intervalTrendPerWeek
+            Text(
+                "Пузырь растёт: ${"%+.0f".format(b.capacityGrowthMlPerWeek)} мл/нед · интервал ${"%+.0f".format(trend * 100)}%/нед",
+                style = MaterialTheme.typography.bodySmall, color = onColor
+            )
+            snapshot.interoception.sensitivity?.thresholdPct?.let {
+                Text("Порог различения: ≈ ${it.roundToInt()}% наполненности (меньше = чутче)", style = MaterialTheme.typography.bodySmall, color = onColor)
+            }
+        }
+    }
 }

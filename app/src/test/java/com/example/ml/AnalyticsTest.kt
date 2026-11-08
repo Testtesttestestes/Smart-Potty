@@ -2,6 +2,8 @@ package com.example.ml
 
 import com.example.data.Child
 import com.example.data.EventTypes
+import com.example.data.FlowPatterns
+import com.example.data.Initiators
 import com.example.data.TrackerEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -308,9 +310,9 @@ class TrackerAnalyticsTest {
     @Test
     fun noAlertWhileAsleep() {
         val events = listOf(pee(0), pee(2 * HOUR), event(2 * HOUR + 5 * MIN, EventTypes.SLEEP))
-        val snap = TrackerAnalytics.compute(events, null, 6 * HOUR, UTC)
+        val snap = TrackerAnalytics.compute(events, null, 6 * HOUR, UTC, settings = Coaching.Settings(Coaching.Mode.SAFETY))
         assertTrue(snap.isAsleepNow)
-        assertTrue(!snap.shouldAlert)
+        assertEquals(Coaching.Action.NONE, snap.decision.action)
     }
 
     @Test
@@ -348,7 +350,7 @@ class SignalModelTest {
         val events = dataset(withSignals = false)
         val now = events.maxOf { it.timestamp } + 1
         val ex = IntervalExtractor.extract(events, null, now, UTC)
-        val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(ex.intervals), 30.0)
+        val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(ex.intervals, now), 30.0)
         val pred = post.predictive(BayesianSurvivalModel.Features())
         val maxP5 = (0..240 step 5).maxOf { pred.conditionalProbability(it.toDouble(), 5.0) }
         assertTrue("max 5-min probability from timing alone: $maxP5", maxP5 < 0.35)
@@ -371,7 +373,7 @@ class SignalModelTest {
         val nowLater = lastVoid + 100 * MIN
         val live = withSig + holdEvent(nowLater - MIN, "сильно", 3)
         val snap = TrackerAnalytics.compute(live, null, nowLater, UTC, learned)
-        assertTrue("p5 ${snap.probNext5}", snap.probNext5 >= TrackerAnalytics.COMMAND_THRESHOLD)
+        assertTrue("p5 ${snap.probNext5}", snap.probNext5 >= 0.5f)
         val quiet = TrackerAnalytics.compute(withSig, null, nowLater, UTC, learned)
         assertTrue("quiet p5 ${quiet.probNext5}", quiet.probNext5 < 0.2f)
     }
@@ -382,5 +384,192 @@ class SignalModelTest {
         assertEquals(SignalModel.Signal(3, 2), SignalModel.signalAt(reports, 0, 20 * MIN))
         assertEquals(SignalModel.Signal.NONE, SignalModel.signalAt(reports, 0, 40 * MIN))
         assertEquals(SignalModel.Signal.NONE, SignalModel.signalAt(reports, 15 * MIN, 20 * MIN)) // before last void
+    }
+}
+
+class UroflowTest {
+    private fun curve(hz: Int, pauseAtSec: Double? = null): List<UroflowAnalyzer.Sample> {
+        val out = mutableListOf<UroflowAnalyzer.Sample>()
+        var g = 0.0
+        val dt = 1000L / hz
+        var t = 0L
+        while (t <= 20_000) {
+            val sec = t / 1000.0
+            val flowing = sec in 2.0..12.0 && (pauseAtSec == null || sec !in pauseAtSec..(pauseAtSec + 1.5))
+            if (flowing) g += 12.0 * dt / 1000.0 // 12 g/s
+            out.add(UroflowAnalyzer.Sample(t, g))
+            t += dt
+        }
+        return out
+    }
+
+    @Test
+    fun smoothStream_isBell() {
+        val f = UroflowAnalyzer.analyze(curve(10))!!
+        assertEquals(FlowPatterns.BELL, f.pattern)
+        assertEquals(2_000.0, f.streamStartMs.toDouble(), 400.0)
+        assertEquals(12.0 / BladderModel.URINE_DENSITY_G_PER_ML, f.maxFlowMlPerSec!!, 1.0)
+        assertEquals(120.0 / BladderModel.URINE_DENSITY_G_PER_ML, f.volumeMl, 2.0)
+    }
+
+    @Test
+    fun stopAndRestart_isInterrupted() {
+        assertEquals(FlowPatterns.INTERRUPTED, UroflowAnalyzer.analyze(curve(10, pauseAtSec = 6.0))!!.pattern)
+    }
+
+    @Test
+    fun lowSampleRate_isUnknownButHasVolume() {
+        val f = UroflowAnalyzer.analyze(curve(1))!!
+        assertEquals(FlowPatterns.UNKNOWN, f.pattern)
+        assertTrue(f.volumeMl > 100)
+    }
+}
+
+class AccidentModelTest {
+    private fun leak(ts: Long) = TrackerEvent(childId = "c", timestamp = ts, eventType = EventTypes.LEAK)
+
+    private fun history(): MutableList<TrackerEvent> {
+        // Regular child: 120 ml every 120 min → 1 ml/min.
+        return MutableList(20) { pee(it * 120 * MIN, 120) }
+    }
+
+    @Test
+    fun leakWithFullNextVoid_isLeak_andDoesNotRestartInterval() {
+        val base = history()
+        val t0 = 19 * 120 * MIN
+        val events = base + leak(t0 + 60 * MIN) + pee(t0 + 120 * MIN, 115)
+        val now = t0 + 130 * MIN
+        val snap = TrackerAnalytics.compute(events, null, now, UTC)
+        assertEquals(AccidentModel.LeakVerdict.LEAK, snap.leaks.single().verdict)
+        assertEquals(120.0, IntervalExtractor.extract(events, null, now, UTC).intervals.last().durationMin, 1e-9)
+    }
+
+    @Test
+    fun leakWithSmallNextVoid_wasAnAccident() {
+        val base = history()
+        val t0 = 19 * 120 * MIN
+        val events = base + leak(t0 + 90 * MIN) + pee(t0 + 120 * MIN, 30)
+        val snap = TrackerAnalytics.compute(events, null, t0 + 130 * MIN, UTC)
+        assertEquals(AccidentModel.LeakVerdict.EMPTIED, snap.leaks.single().verdict)
+        val leakId = events.first { it.eventType == EventTypes.LEAK }.eventId
+        // Became an accident void with a model-estimated volume ≈ 90 ml.
+        assertEquals(90.0, snap.accidentVolumeEstimates[leakId]!!, 10.0)
+    }
+}
+
+class CoachingTest {
+    private fun command(ts: Long, target: Int) =
+        TrackerEvent(childId = "c", timestamp = ts, eventType = EventTypes.COMMAND, holdTargetMin = target)
+
+    @Test
+    fun staircase_threeUpOneDown() {
+        val settings = Coaching.Settings(stepMin = 1, startHoldMin = 2)
+        val ev = mutableListOf<TrackerEvent>()
+        var t = 0L
+        fun trial(target: Int, holdMin: Int, accident: Boolean) {
+            ev.add(command(t, target))
+            ev.add(pee(t + holdMin * MIN, if (accident) null else 100, accident = accident))
+            t += 3 * HOUR
+        }
+        trial(2, 3, false); trial(2, 3, false); trial(2, 3, false)
+        assertEquals(3, Coaching.staircase(ev, settings).nextTargetMin)
+        trial(3, 1, true)
+        assertEquals(2, Coaching.staircase(ev, settings).nextTargetMin)
+        trial(2, 1, false) // went early
+        assertEquals(Coaching.HoldOutcome.FAILED_EARLY, Coaching.staircase(ev, settings).trials.last().outcome)
+        assertEquals(1, Coaching.staircase(ev, settings).nextTargetMin)
+    }
+
+    @Test
+    fun initiator_appWhenPromptedRecently() {
+        val prompt = TrackerEvent(childId = "c", timestamp = 0, eventType = EventTypes.PROMPT)
+        val p1 = pee(5 * MIN)
+        val p2 = pee(60 * MIN)
+        assertEquals(Initiators.APP, Coaching.initiatorOf(p1, listOf(prompt, p1)))
+        assertEquals(Initiators.CHILD, Coaching.initiatorOf(p2, listOf(prompt, p2)))
+    }
+
+    @Test
+    fun quietNeverActs_safetyFadesWithSuccess() {
+        val bladder = BladderModel.Estimate(150.0, 150.0, 5, 1.0, 0.8)
+        val stairs = Coaching.Staircase(2, emptyList(), null)
+        val quiet = Coaching.decide(Coaching.Settings(Coaching.Mode.QUIET), 0.99, SignalModel.Signal.NONE, false, true, null, stairs, bladder)
+        assertEquals(Coaching.Action.NONE, quiet.action)
+        val safety = Coaching.decide(Coaching.Settings(Coaching.Mode.SAFETY), 0.6, SignalModel.Signal.NONE, false, true, 0.0, stairs, bladder)
+        assertEquals(Coaching.Action.PROMPT_GO, safety.action)
+        val skilled = Coaching.decide(Coaching.Settings(Coaching.Mode.SAFETY), 0.6, SignalModel.Signal.NONE, false, true, 0.8, stairs, bladder)
+        assertEquals(Coaching.Action.NONE, skilled.action) // bar rose to 0.82
+        val hold = Coaching.decide(Coaching.Settings(Coaching.Mode.HOLD_TRAINING), 0.1, SignalModel.Signal(2, 0), false, true, null, stairs, bladder)
+        assertEquals(Coaching.Action.COMMAND_HOLD, hold.action)
+        // Fill 80% at 1 ml/min of 150 ml: ≤ 1.05 → at most 37 min, staircase 2 min → 2.
+        assertEquals(2, hold.holdTargetMin)
+    }
+}
+
+class InteroSuccessTest {
+    private fun sit(ts: Long) = TrackerEvent(childId = "c", timestamp = ts, eventType = EventTypes.SIT)
+
+    @Test
+    fun idealVoid_isSuccess_promptedOrEmptyIsNot() {
+        val now = 10 * HOUR
+        val events = listOf(
+            pee(0, 100),
+            sit(2 * HOUR - 10_000), pee(2 * HOUR, 140),                 // self, full, 10 s → success
+            TrackerEvent(childId = "c", timestamp = 4 * HOUR - 5 * MIN, eventType = EventTypes.PROMPT),
+            pee(4 * HOUR, 140),                                         // prompted → not
+            pee(5 * HOUR, 40),                                          // low fill → not
+            sit(6 * HOUR)                                               // sat, nothing → early
+        )
+        val ex = IntervalExtractor.extract(events, null, now, UTC)
+        val r = InteroSuccess.compute(events, ex, 150.0, now, UTC)
+        val byTs = r.scores.associateBy { it.timestamp }
+        assertTrue(byTs[2 * HOUR]!!.success)
+        assertEquals(10_000L, byTs[2 * HOUR]!!.latencyMs)
+        assertTrue(!byTs[4 * HOUR]!!.success)
+        assertTrue(!byTs[5 * HOUR]!!.success)
+        assertEquals(1, r.weeks.sumOf { it.earlySits })
+    }
+
+    @Test
+    fun shyInterruptedFlow_isNotPenalizedForLatency() {
+        val now = 10 * HOUR
+        val shy = pee(2 * HOUR, 140).copy(flowPattern = FlowPatterns.INTERRUPTED)
+        val events = listOf(pee(0, 100), sit(2 * HOUR - 3 * MIN), shy)
+        val r = InteroSuccess.compute(events, IntervalExtractor.extract(events, null, now, UTC), 150.0, now, UTC)
+        assertTrue(r.scores.first { it.eventId == shy.eventId }.success)
+    }
+}
+
+class TrendAndSensitivityTest {
+    @Test
+    fun growingIntervals_trendIsTracked() {
+        // Interval grows ~10%/week over 6 weeks, 6 voids a day.
+        val now = 42 * DAY
+        val obs = (0 until 42 * 6).map { i ->
+            val ts = i * 4 * HOUR
+            val minutes = 90.0 * Math.pow(1.10, ts.toDouble() / BayesianSurvivalModel.WEEK_MS)
+            BayesianSurvivalModel.Observation(
+                minutes,
+                BayesianSurvivalModel.Features(weeksFromNow = (ts - now).toDouble() / BayesianSurvivalModel.WEEK_MS),
+                IntervalExtractor.recencyWeight(now - ts)
+            )
+        }
+        val r = BayesianSurvivalModel.analyze(obs, 0L, BayesianSurvivalModel.Features(), 30.0)
+        assertEquals(0.10, r.intervalTrendPerWeek, 0.02)
+        // Extrapolated to now (≈ 90·1.1^6 ≈ 159), not the lagging recency-weighted average.
+        assertEquals(90.0 * Math.pow(1.1, 6.0), r.medianIntervalMillis / 60_000.0, 8.0)
+    }
+
+    @Test
+    fun sharperChild_hasLowerDiscriminationThreshold() {
+        val rnd = Random(5)
+        fun sample(noise: Double): InteroceptionMetrics.Sensitivity {
+            val fills = List(200) { rnd.nextDouble() }
+            val levels = fills.map { f -> ((f + rnd.nextDouble(-noise, noise)) * 4).toInt().coerceIn(0, 3) }
+            return InteroceptionMetrics.fitSensitivity(levels, fills)!!
+        }
+        val sharp = sample(0.05)
+        val blunt = sample(0.4)
+        assertTrue("sharp ${sharp.thresholdPct} blunt ${blunt.thresholdPct}", sharp.thresholdPct!! < blunt.thresholdPct!! / 2)
     }
 }
