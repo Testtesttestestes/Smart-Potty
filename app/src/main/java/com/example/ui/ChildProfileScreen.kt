@@ -241,7 +241,7 @@ fun ChildFormDialog(
                 OutlinedTextField(
                     value = sleepSchedule,
                     onValueChange = { sleepSchedule = it },
-                    label = { Text("Sleep Schedule - Optional") },
+                    label = { Text("Sleep Schedule - Optional (e.g. 21:00-07:30)") },
                     modifier = Modifier.fillMaxWidth().testTag("sleep_input")
                 )
 

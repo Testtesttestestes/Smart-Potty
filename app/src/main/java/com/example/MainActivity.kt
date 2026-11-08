@@ -8,6 +8,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppDatabase
 import com.example.data.ChildRepository
+import com.example.data.CoachingSettingsRepository
 import com.example.ui.ChildProfileScreen
 import com.example.ui.SplashScreen
 import com.example.ui.theme.MyApplicationTheme
@@ -34,7 +35,7 @@ class MainActivity : ComponentActivity() {
     val childRepository = ChildRepository(database.childDao())
     val childFactory = ChildViewModelFactory(childRepository)
     val eventRepository = TrackerEventRepository(database.trackerEventDao())
-    val eventFactory = TrackerEventViewModelFactory(eventRepository)
+    val eventFactory = TrackerEventViewModelFactory(eventRepository, childRepository, CoachingSettingsRepository(this))
 
     setContent {
       MyApplicationTheme {
