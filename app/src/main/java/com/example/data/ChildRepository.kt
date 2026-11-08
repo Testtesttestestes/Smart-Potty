@@ -5,6 +5,8 @@ import kotlinx.coroutines.flow.Flow
 class ChildRepository(private val childDao: ChildDao) {
     val allChildren: Flow<List<Child>> = childDao.getAllChildren()
 
+    fun getChild(id: String): Flow<Child?> = childDao.getChildById(id)
+
     suspend fun insert(child: Child) {
         childDao.insertChild(child)
     }

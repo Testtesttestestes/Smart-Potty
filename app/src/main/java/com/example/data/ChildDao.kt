@@ -11,6 +11,9 @@ interface ChildDao {
     @Query("SELECT * FROM children")
     fun getAllChildren(): Flow<List<Child>>
 
+    @Query("SELECT * FROM children WHERE childId = :id LIMIT 1")
+    fun getChildById(id: String): Flow<Child?>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertChild(child: Child)
 

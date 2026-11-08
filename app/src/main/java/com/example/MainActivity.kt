@@ -34,7 +34,7 @@ class MainActivity : ComponentActivity() {
     val childRepository = ChildRepository(database.childDao())
     val childFactory = ChildViewModelFactory(childRepository)
     val eventRepository = TrackerEventRepository(database.trackerEventDao())
-    val eventFactory = TrackerEventViewModelFactory(eventRepository)
+    val eventFactory = TrackerEventViewModelFactory(eventRepository, childRepository)
 
     setContent {
       MyApplicationTheme {

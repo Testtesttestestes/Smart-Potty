@@ -19,35 +19,24 @@ class ExampleUnitTest {
 
   @Test
   fun testBayesianSurvivalModel_behavior() {
-    // 1. Initial state (no past intervals)
-    val noDataResult = BayesianSurvivalModel.analyze(emptyList(), 0L)
-    
-    // Prob should be very small right after pee
-    assertTrue("Initial prob at 0 time should be < 10%", noDataResult.probabilityNow < 0.1f)
-    assertTrue("Expected interval should be > 60 mins", (noDataResult.expectedIntervalMillis / 60000) > 60)
+    val none = BayesianSurvivalModel.Features()
+    // 1. Initial state (no past intervals): age prior, low probability right after a void
+    val noDataResult = BayesianSurvivalModel.analyze(emptyList(), 0L, none, null)
+    assertTrue("Initial prob at 0 time should be < 10%", noDataResult.probNext30 < 0.1f)
+    assertTrue("Expected interval should be > 60 mins", (noDataResult.medianIntervalMillis / 60000) > 60)
 
-    // 2. Add some regular ~120 min intervals
-    val intervals = listOf(
-        120L * 60000,
-        115L * 60000,
-        125L * 60000,
-        110L * 60000
-    )
-    
-    // Check at 10 minutes (should be almost 0% prob)
-    val earlyResult = BayesianSurvivalModel.analyze(intervals, 10L * 60000)
-    assertTrue("Prob at 10 mins should be extremely small", earlyResult.probabilityNow < 0.05f)
-    
-    // Check at 120 minutes (should be roughly around 50% depending on variance)
-    val timeToPeeResult = BayesianSurvivalModel.analyze(intervals, 120L * 60000)
-    assertTrue("Prob at 120 mins should be substantial (> 30%)", timeToPeeResult.probabilityNow > 0.3f)
-    
-    // Check at 240 minutes (should be nearly 100%)
-    val lateResult = BayesianSurvivalModel.analyze(intervals, 240L * 60000)
-    assertTrue("Prob at 240 mins should be very high (> 80%)", lateResult.probabilityNow > 0.8f)
-    
-    // Expected interval should adapt near to 120 mins
-    val distDiff = Math.abs((timeToPeeResult.expectedIntervalMillis / 60000) - 120L)
+    // 2. Regular ~120 min intervals
+    val intervals = listOf(120.0, 115.0, 125.0, 110.0).map { BayesianSurvivalModel.Observation(it, none) }
+    val earlyResult = BayesianSurvivalModel.analyze(intervals, 10L * 60000, none, null)
+    assertTrue("Prob at 10 mins should be extremely small", earlyResult.probNext30 < 0.05f)
+
+    val timeToPeeResult = BayesianSurvivalModel.analyze(intervals, 110L * 60000, none, null)
+    assertTrue("Prob within 30 min at 110 mins should be substantial", timeToPeeResult.probNext30 > 0.3f)
+
+    val lateResult = BayesianSurvivalModel.analyze(intervals, 240L * 60000, none, null)
+    assertTrue("Cumulative prob at 240 mins should be very high (> 80%)", lateResult.cumulativeProbability > 0.8f)
+
+    val distDiff = Math.abs((timeToPeeResult.medianIntervalMillis / 60000) - 120L)
     assertTrue("Expected should adapt to ~120. Diff: $distDiff mins", distDiff < 15L)
   }
 

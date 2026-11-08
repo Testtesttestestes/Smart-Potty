@@ -15,7 +15,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.EventTypes
 import com.example.data.TrackerEvent
+import com.example.ml.BayesianSurvivalModel
+import com.example.ml.BladderModel
+import com.example.ml.InteroceptionMetrics
+import com.example.ml.TrackerAnalytics
+import kotlin.math.roundToInt
 import com.example.viewmodel.TrackerEventViewModel
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -40,59 +46,73 @@ fun TrackerScreen(
     var filterType by remember { mutableStateOf("All") }
     val context = LocalContext.current
 
+    val analytics by remember(childId) { viewModel.analyticsForChild(childId) }
+        .collectAsStateWithLifecycle(initialValue = null)
+    val currentProbability = analytics?.model?.probNext30 ?: 0f
+
+    // Every saved event gets the current capacity estimate (pee) and the model version of any stored probability.
+    fun save(event: TrackerEvent) {
+        val snapshot = analytics
+        var e = event
+        if (e.eventType == EventTypes.PEE && e.estimatedBladderCapacityMl == null && snapshot != null) {
+            e = e.copy(estimatedBladderCapacityMl = snapshot.bladder.personalCapacityMl.roundToInt())
+        }
+        if (snapshot == null || !snapshot.model.hasLastVoid) {
+            // No real prediction available yet: don't store a fake 0% that would distort the metrics.
+            e = e.copy(predictedProbability = null, commandProbability = null)
+        }
+        if ((e.predictedProbability != null || e.commandProbability != null) && e.modelVersion == null) {
+            e = e.copy(modelVersion = BayesianSurvivalModel.MODEL_VERSION)
+        }
+        viewModel.saveEvent(e)
+    }
+
     val fillLevel by bleViewModel.fillLevel.collectAsStateWithLifecycle()
-    // Session states for bottom weight sensor scale
-    var activeEventId by remember { mutableStateOf<String?>(null) }
+    // Session state for the bottom weight sensor scale
+    var activeEvent by remember { mutableStateOf<TrackerEvent?>(null) }
     var previousMaxWeight by remember { mutableStateOf(0) }
 
     LaunchedEffect(fillLevel) {
         val currentWeight = fillLevel ?: 0
-        if (currentWeight >= 15) { // Minimum threshold weight of 15g/ml to count as a potty session
-            if (activeEventId == null) {
-                // Starting a new potty session of child staying & peeing
-                val now = System.currentTimeMillis()
+        if (currentWeight >= 15) { // Minimum threshold weight of 15 g to count as a potty session
+            val active = activeEvent
+            if (active == null) {
+                // Starting a new potty session
                 val newEvent = TrackerEvent(
                     childId = childId,
-                    timestamp = now,
-                    eventType = "pee",
-                    volumeLevel = currentWeight,
-                    voidedVolumeMl = currentWeight,
+                    timestamp = System.currentTimeMillis(),
+                    eventType = EventTypes.PEE,
+                    volumeLevel = currentWeight, // raw grams from the scale
+                    voidedVolumeMl = BladderModel.gramsToMl(currentWeight),
                     isAccident = false
                 )
-                activeEventId = newEvent.eventId
+                activeEvent = newEvent
                 previousMaxWeight = currentWeight
-                viewModel.saveEvent(newEvent)
-            } else {
-                // Ongoing potty session: if weight increases, update the existing session event rather than creating a new one
-                if (currentWeight > previousMaxWeight) {
-                    previousMaxWeight = currentWeight
-                    viewModel.saveEvent(
-                        TrackerEvent(
-                            eventId = activeEventId!!,
-                            childId = childId,
-                            timestamp = System.currentTimeMillis(),
-                            eventType = "pee",
-                            volumeLevel = currentWeight,
-                            voidedVolumeMl = currentWeight,
-                            isAccident = false
-                        )
-                    )
-                }
+                save(newEvent)
+            } else if (currentWeight > previousMaxWeight) {
+                // Ongoing session: update the volume only, keep the session start time and other fields
+                previousMaxWeight = currentWeight
+                val updated = active.copy(
+                    volumeLevel = currentWeight,
+                    voidedVolumeMl = BladderModel.gramsToMl(currentWeight)
+                )
+                activeEvent = updated
+                save(updated)
             }
         } else if (currentWeight < 10) {
             // Potty is dry or emptied, reset session lock
-            activeEventId = null
+            activeEvent = null
             previousMaxWeight = 0
         }
     }
 
-    val peeEvents = remember(allEvents) { allEvents.filter { it.eventType == "pee" } }
+    val peeEvents = remember(allEvents) { allEvents.filter { it.eventType == EventTypes.PEE } }
 
     val filteredEvents = remember(allEvents, filterType) {
         when (filterType) {
-            "Successful" -> allEvents.filter { it.eventType == "pee" && !it.isAccident }
-            "Accidents" -> allEvents.filter { it.eventType == "pee" && it.isAccident }
-            "Sensations" -> allEvents.filter { it.eventType == "sensation" }
+            "Successful" -> allEvents.filter { it.eventType == EventTypes.PEE && !it.isAccident }
+            "Accidents" -> allEvents.filter { it.eventType == EventTypes.PEE && it.isAccident }
+            "Sensations" -> allEvents.filter { it.eventType == EventTypes.SENSATION }
             else -> allEvents
         }
     }
@@ -101,56 +121,13 @@ fun TrackerScreen(
     val successCount = peeEvents.count { !it.isAccident }
     val accidentCount = peeEvents.count { it.isAccident }
 
-    var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            kotlinx.coroutines.delay(60_000)
-            currentTime = System.currentTimeMillis()
-        }
-    }
-
-    val intervalStats = remember(peeEvents) {
-        if (peeEvents.size < 2) return@remember null
-        
-        val sortedAsc = peeEvents.sortedBy { it.timestamp }
-        val intervals = mutableListOf<Long>()
-        for (i in 1 until sortedAsc.size) {
-            intervals.add(sortedAsc[i].timestamp - sortedAsc[i - 1].timestamp)
-        }
-        
-        val avg = intervals.average().toLong()
-        val min = intervals.minOrNull() ?: 0L
-        val max = intervals.maxOrNull() ?: 0L
-        val sortedIntervals = intervals.sorted()
-        val median = if (sortedIntervals.size % 2 == 0) {
-            (sortedIntervals[sortedIntervals.size / 2 - 1] + sortedIntervals[sortedIntervals.size / 2]) / 2
-        } else {
-            sortedIntervals[sortedIntervals.size / 2]
-        }
-        
-        IntervalStats(avg, min, max, median)
-    }
-
-    val bayesianModelResult = remember(peeEvents, currentTime) {
-        val sortedAsc = peeEvents.sortedBy { it.timestamp }
-        val intervals = mutableListOf<Long>()
-        for (i in 1 until sortedAsc.size) {
-            intervals.add(sortedAsc[i].timestamp - sortedAsc[i - 1].timestamp)
-        }
-        val mostRecentEvent = peeEvents.maxByOrNull { it.timestamp }
-        val timeSinceLast = if (mostRecentEvent != null) currentTime - mostRecentEvent.timestamp else 0L
-        
-        com.example.ml.BayesianSurvivalModel.analyze(intervals, timeSinceLast)
-    }
-
-    val currentProbability = bayesianModelResult.probabilityNow
-
     val mostRecentPee = remember(peeEvents) { peeEvents.maxByOrNull { it.timestamp } }
     var hasTriggeredCommandThisCycle by remember(mostRecentPee) { mutableStateOf(false) }
     var showCommandDialog by remember { mutableStateOf(false) }
 
-    LaunchedEffect(currentProbability) {
-        if (currentProbability >= 0.70f && !hasTriggeredCommandThisCycle) {
+    val shouldAlert = analytics?.shouldAlert == true
+    LaunchedEffect(shouldAlert, mostRecentPee) {
+        if (shouldAlert && !hasTriggeredCommandThisCycle) {
             showCommandDialog = true
             hasTriggeredCommandThisCycle = true
             try {
@@ -160,39 +137,6 @@ fun TrackerScreen(
                 e.printStackTrace()
             }
         }
-    }
-
-    val calibrationStats = remember(allEvents) {
-        val stats = mutableMapOf<String, MutableList<Int>>()
-        val sortedAsc = allEvents.sortedBy { it.timestamp }
-        
-        for (i in sortedAsc.indices) {
-            val event = sortedAsc[i]
-            if (event.eventType == "pee" && event.voidedVolumeMl != null) {
-                // Find most recent sensation event before this pee, within 2 hours
-                val recentSensation = sortedAsc.subList(0, i).findLast { 
-                    it.eventType == "sensation" && (event.timestamp - it.timestamp) < 2 * 60 * 60 * 1000L 
-                } ?: if (event.sensationLevel != null && event.sensationLevel != "ничего") event else null
-                
-                if (recentSensation?.sensationLevel != null) {
-                    val sens = recentSensation.sensationLevel
-                    if (sens != "ничего") {
-                        if (stats[sens] == null) stats[sens] = mutableListOf()
-                        stats[sens]!!.add(event.voidedVolumeMl)
-                    }
-                }
-            }
-        }
-        
-        val results = mutableMapOf<String, Pair<Int, Int>>()
-        for ((k, v) in stats) {
-            if (v.isNotEmpty()) {
-                val min = v.minOrNull() ?: 0
-                val max = v.maxOrNull() ?: 0
-                results[k] = Pair(min, max)
-            }
-        }
-        results
     }
 
     Scaffold(
@@ -206,20 +150,10 @@ fun TrackerScreen(
                 },
                 actions = {
                     TextButton(onClick = {
-                        val format = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
-                        val exportText = allEvents.joinToString("\n") { ev ->
-                            val timeStr = format.format(Date(ev.timestamp))
-                            if (ev.eventType == "sensation") {
-                                "[$timeStr] Sensation: ${ev.sensationLevel}"
-                            } else {
-                                val type = if (ev.isAccident) "Accident" else "Successful"
-                                "[$timeStr] $type - Vol: ${ev.volumeLevel ?: "?"}"
-                            }
-                        }
-                        
+                        val exportText = eventsToCsv(allEvents)
                         val intent = Intent(Intent.ACTION_SEND).apply {
                             type = "text/plain"
-                            putExtra(Intent.EXTRA_SUBJECT, "Exported Events")
+                            putExtra(Intent.EXTRA_SUBJECT, "Exported Events (CSV)")
                             putExtra(Intent.EXTRA_TEXT, exportText)
                         }
                         context.startActivity(Intent.createChooser(intent, "Export Data"))
@@ -260,51 +194,9 @@ fun TrackerScreen(
                 Text("Accident: $accidentCount", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
             }
 
-            if (intervalStats != null) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("Intervals", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                            Column(horizontalAlignment = Alignment.End) {
-                                Text("Probability: ${(currentProbability * 100).toInt()}%", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                                Text("Confidence: ${(bayesianModelResult.confidence * 100).toInt()}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
-                            }
-                        }
-                        
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Bayesian Expected: ${formatInterval(bayesianModelResult.expectedIntervalMillis)}", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.secondary)
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Avg: ${formatInterval(intervalStats.avg)}", style = MaterialTheme.typography.bodySmall)
-                            Text("Min: ${formatInterval(intervalStats.min)}", style = MaterialTheme.typography.bodySmall)
-                            Text("Max: ${formatInterval(intervalStats.max)}", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
-
-            if (calibrationStats.isNotEmpty()) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Interoceptive Calibration", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        calibrationStats.forEach { (sensation, range) ->
-                            Text(
-                                text = "Когда ты говоришь \"$sensation\", обычно получается ${if (range.first == range.second) range.first else "${range.first}–${range.second}"} мл",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer
-                            )
-                        }
-                    }
-                }
+            analytics?.let { snapshot ->
+                ForecastCard(snapshot)
+                InteroceptionCard(snapshot.interoception)
             }
 
             val strictEvents = remember(allEvents) { allEvents.filter { it.isStrictCommand } }
@@ -342,7 +234,7 @@ fun TrackerScreen(
                     
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Прогноз позыва >70% запускает приказ «Потерпи еще немного». Обучает ребёнка превосходить модель, опираясь на внутренние сигналы.",
+                        text = "Вероятность позыва в ближайшие 30 минут ≥${(TrackerAnalytics.COMMAND_THRESHOLD * 100).toInt()}% (с учётом того, что позыва ещё не было) запускает приказ «Потерпи еще немного». Во время сна приказ не срабатывает.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
                     )
@@ -401,7 +293,7 @@ fun TrackerScreen(
                 ) {
                     items(filteredEvents.size) { index ->
                         val event = filteredEvents[index]
-                        val interval = if (event.eventType == "pee") {
+                        val interval = if (event.eventType == EventTypes.PEE) {
                             val previousEvent = peeEvents.filter { it.timestamp < event.timestamp }.maxByOrNull { it.timestamp }
                             previousEvent?.let { formatInterval(event.timestamp - it.timestamp) }
                         } else null
@@ -429,6 +321,25 @@ fun TrackerScreen(
                     TextButton(onClick = { dialogType = "sensation" }, modifier = Modifier.fillMaxWidth()) { 
                         Text("Log Sensation") 
                     }
+                    TextButton(onClick = { dialogType = "drink" }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Питьё")
+                    }
+                    val asleep = analytics?.isAsleepNow == true
+                    TextButton(
+                        onClick = {
+                            save(
+                                TrackerEvent(
+                                    childId = childId,
+                                    timestamp = System.currentTimeMillis(),
+                                    eventType = if (asleep) EventTypes.WAKE else EventTypes.SLEEP
+                                )
+                            )
+                            dialogType = null
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("sleep_toggle_button")
+                    ) {
+                        Text(if (asleep) "Проснулся" else "Уснул")
+                    }
                 }
             },
             confirmButton = {}
@@ -440,7 +351,7 @@ fun TrackerScreen(
             childId = childId,
             onDismiss = { dialogType = null },
             onSave = { event ->
-                viewModel.saveEvent(event)
+                save(event)
                 dialogType = null
             }
         )
@@ -453,7 +364,7 @@ fun TrackerScreen(
             strictProbability = currentProbability,
             onDismiss = { dialogType = null },
             onSave = { event ->
-                viewModel.saveEvent(event)
+                save(event)
                 dialogType = null
             }
         )
@@ -487,7 +398,7 @@ fun TrackerScreen(
                     )
                     
                     Text(
-                        text = "Вероятность позыва составляет ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
+                        text = "Вероятность позыва в ближайшие 30 минут — ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onErrorContainer,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -519,11 +430,11 @@ fun TrackerScreen(
                     
                     FilledTonalButton(
                         onClick = {
-                            viewModel.saveEvent(
+                            save(
                                 TrackerEvent(
                                     childId = childId,
                                     timestamp = System.currentTimeMillis(),
-                                    eventType = "pee",
+                                    eventType = EventTypes.PEE,
                                     isAccident = true,
                                     isStrictCommand = true,
                                     commandProbability = currentProbability,
@@ -546,13 +457,24 @@ fun TrackerScreen(
         }
     }
 
+    if (dialogType == "drink") {
+        AddDrinkDialog(
+            childId = childId,
+            onDismiss = { dialogType = null },
+            onSave = { event ->
+                save(event)
+                dialogType = null
+            }
+        )
+    }
+
     if (dialogType == "sensation") {
         AddSensationDialog(
             childId = childId,
             currentProbability = currentProbability,
             onDismiss = { dialogType = null },
             onSave = { event ->
-                viewModel.saveEvent(event)
+                save(event)
                 dialogType = null
             }
         )
@@ -566,12 +488,6 @@ fun formatInterval(millis: Long): String {
     return if (hours > 0) "${hours}h ${mins}m" else "${mins}m"
 }
 
-data class IntervalStats(
-    val avg: Long,
-    val min: Long,
-    val max: Long,
-    val median: Long
-)
 
 @Composable
 fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
@@ -587,7 +503,19 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                if (event.eventType == "sensation") {
+                if (event.eventType == EventTypes.DRINK || event.eventType == EventTypes.SLEEP || event.eventType == EventTypes.WAKE) {
+                    Text(
+                        text = when (event.eventType) {
+                            EventTypes.DRINK -> "Питьё: ${event.fluidIntakeMl ?: "?"} мл"
+                            EventTypes.SLEEP -> "Уснул"
+                            else -> "Проснулся"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                    Text(text = "Time: $dateString", style = MaterialTheme.typography.bodyMedium)
+                } else if (event.eventType == EventTypes.SENSATION) {
                     Text(
                         text = "Sensation Log",
                         style = MaterialTheme.typography.titleMedium,
@@ -640,7 +568,7 @@ fun EventCard(event: TrackerEvent, interval: String?, onDelete: () -> Unit) {
                     Text(text = "Time: $dateString", style = MaterialTheme.typography.bodyMedium)
                     val displayVol = event.voidedVolumeMl ?: event.volumeLevel
                     if (displayVol != null) {
-                        Text(text = "Voided Volume: $displayVol ml ($displayVol g)", style = MaterialTheme.typography.bodyMedium)
+                        Text(text = "Voided Volume: $displayVol ml", style = MaterialTheme.typography.bodyMedium)
                     }
                     if (event.holdingLevel != null && event.holdingLevel > 0) {
                         val holdingLabel = when (event.holdingLevel) {
@@ -813,7 +741,7 @@ fun AddEventDialog(
                                 TrackerEvent(
                                     childId = childId,
                                     timestamp = System.currentTimeMillis(),
-                                    eventType = "pee",
+                                    eventType = EventTypes.PEE,
                                     volumeLevel = volumeValue,
                                     voidedVolumeMl = volumeValue,
                                     isAccident = isAccident,
@@ -917,7 +845,7 @@ fun AddSensationDialog(
                                 TrackerEvent(
                                     childId = childId,
                                     timestamp = System.currentTimeMillis(),
-                                    eventType = "sensation",
+                                    eventType = EventTypes.SENSATION,
                                     sensationLevel = sensationLevel,
                                     predictedProbability = currentProbability,
                                     holdingBehavior = holdingLevel > 0,
@@ -932,4 +860,145 @@ fun AddSensationDialog(
             }
         }
     }
+}
+
+private fun pct(x: Double?): String = x?.let { "${(it * 100).roundToInt()}%" } ?: "—"
+
+@Composable
+fun ForecastCard(snapshot: TrackerAnalytics.Snapshot) {
+    val m = snapshot.model
+    val b = snapshot.bladder
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("forecast_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Прогноз", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                Column(horizontalAlignment = Alignment.End) {
+                    if (snapshot.isAsleepNow) {
+                        Text("Спит", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Bold)
+                    } else if (m.hasLastVoid) {
+                        Text("В ближайшие 30 мин: ${pct(m.probNext30.toDouble())}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                    }
+                    Text("Уверенность: ${pct(m.confidence.toDouble())}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                }
+            }
+            Text(
+                "Обычный интервал: ${formatInterval(m.medianIntervalMillis)} (80%: ${formatInterval(m.interval80Millis.first)}–${formatInterval(m.interval80Millis.second)})",
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (m.hasLastVoid && !snapshot.isAsleepNow) {
+                Text(
+                    "15 мин: ${pct(m.probNext15.toDouble())} · 60 мин: ${pct(m.probNext60.toDouble())}" +
+                        (m.medianTimeLeftMillis?.let { " · осталось ≈ ${formatInterval(it)}" } ?: ""),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Text(
+                "Пузырь: ёмкость ≈ ${b.personalCapacityMl.roundToInt()} мл (по возрасту ${b.expectedCapacityMl.roundToInt()})" +
+                    (b.currentFill?.let { " · наполнен ≈ ${pct(it.coerceAtMost(1.5))}" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+            val cal = snapshot.calibration
+            Text(
+                if (cal.n < 10 || cal.brier == null) "Проверка точности на истории: мало данных (дневных интервалов: ${snapshot.dayIntervalCount})"
+                else "Проверка на истории: Brier ${"%.2f".format(cal.brier)} (n=${cal.n})" +
+                    (cal.skill?.let { ", лучше базового на ${pct(it)}" } ?: ""),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun InteroceptionCard(r: InteroceptionMetrics.Result) {
+    if (r.pairCount == 0 && r.comparison.n == 0) return
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("interoception_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            val onColor = MaterialTheme.colorScheme.onSecondaryContainer
+            Text("Интероцепция", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = onColor)
+            r.levels.filter { it.n > 0 }.forEach { l ->
+                val range = if (l.q25FillPct != null && l.q75FillPct != null && l.n >= 3)
+                    " (${l.q25FillPct.roundToInt()}–${l.q75FillPct.roundToInt()}%)" else ""
+                Text(
+                    "«${l.level}»: пузырь ≈ ${l.medianFillPct?.roundToInt() ?: "?"}%$range, n=${l.n}",
+                    style = MaterialTheme.typography.bodySmall, color = onColor
+                )
+            }
+            r.sensationFillCorrelation?.let {
+                Text("Связь ощущения с наполнением: ρ = ${"%.2f".format(it)}", style = MaterialTheme.typography.bodySmall, color = onColor)
+            }
+            val c = r.comparison
+            val phaseText = when (c.phase) {
+                InteroceptionMetrics.Phase.INSUFFICIENT_DATA -> "мало данных для сравнения с моделью (n=${c.n})"
+                InteroceptionMetrics.Phase.A_MODEL_BETTER -> "фаза A: модель предсказывает лучше"
+                InteroceptionMetrics.Phase.B_SIMILAR -> "фаза B: ребёнок и модель наравне"
+                InteroceptionMetrics.Phase.C_CHILD_BETTER -> "фаза C: ребёнок лучше модели"
+            }
+            val aucText = if (c.aucChild != null && c.aucModel != null)
+                " · AUC ребёнок ${"%.2f".format(c.aucChild)} / модель ${"%.2f".format(c.aucModel)}" else ""
+            Text(phaseText + aucText, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = onColor)
+        }
+    }
+}
+
+@Composable
+fun AddDrinkDialog(
+    childId: String,
+    onDismiss: () -> Unit,
+    onSave: (TrackerEvent) -> Unit
+) {
+    val presets = listOf(50, 100, 150, 200, 250)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Сколько выпил?") },
+        text = {
+            Column {
+                presets.forEach { ml ->
+                    TextButton(
+                        onClick = {
+                            onSave(
+                                TrackerEvent(
+                                    childId = childId,
+                                    timestamp = System.currentTimeMillis(),
+                                    eventType = EventTypes.DRINK,
+                                    fluidIntakeMl = ml
+                                )
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("drink_preset_$ml")
+                    ) { Text("≈ $ml мл") }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Full labelled dataset (all fields) for analysis or training future sensors. */
+fun eventsToCsv(events: List<TrackerEvent>): String {
+    val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US)
+    fun q(v: Any?): String {
+        val str = v?.toString() ?: ""
+        return if (str.any { it == ',' || it == '"' || it == '\n' }) "\"" + str.replace("\"", "\"\"") + "\"" else str
+    }
+    val header = listOf(
+        "time", "timestamp_ms", "event_type", "voided_volume_ml", "raw_weight_g", "is_accident",
+        "sensation", "holding_level", "fluid_intake_ml", "predicted_probability", "estimated_capacity_ml",
+        "strict_command", "command_probability", "command_result", "model_version"
+    ).joinToString(",")
+    val rows = events.sortedBy { it.timestamp }.map { e ->
+        listOf(
+            iso.format(Date(e.timestamp)), e.timestamp, e.eventType, e.voidedVolumeMl, e.volumeLevel, e.isAccident,
+            e.sensationLevel, e.holdingLevel, e.fluidIntakeMl, e.predictedProbability, e.estimatedBladderCapacityMl,
+            e.isStrictCommand, e.commandProbability, e.commandResult, e.modelVersion
+        ).joinToString(",") { q(it) }
+    }
+    return (listOf(header) + rows).joinToString("\n")
 }
