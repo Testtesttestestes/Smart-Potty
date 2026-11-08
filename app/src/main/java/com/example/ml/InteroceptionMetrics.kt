@@ -8,11 +8,11 @@ import kotlin.random.Random
 
 /**
  * Measures how well the child's own sensations track bladder filling, and compares the
- * child with the model on the same task: "will there be a void within the next 30 minutes?".
+ * child with the model on the same task: "will there be a void within the prediction horizon (5 min)?".
  */
 object InteroceptionMetrics {
 
-    const val HORIZON_MS = 30 * 60_000L
+    val HORIZON_MS = (SignalModel.HORIZON_MIN * 60_000).toLong()
     // Fill at a sensation is interpolated between the surrounding voids, so any daytime gap works.
     private const val PAIR_WINDOW_MS = 3 * 60 * 60_000L
     private const val MIN_SAMPLES = 10
@@ -99,7 +99,7 @@ object InteroceptionMetrics {
         }
         val rho = StatMath.spearman(pairs.map { it.level.toDouble() }, pairs.map { it.fill })
 
-        // 2. Child vs model on "void within 30 min" at each sensation report.
+        // 2. Child vs model on "void within the horizon" at each sensation report.
         val predictions = sensations.mapNotNull { s ->
             // Skip reports whose outcome window is not over yet.
             if (now - s.timestamp < HORIZON_MS && voids.none { it.timestamp > s.timestamp }) return@mapNotNull null

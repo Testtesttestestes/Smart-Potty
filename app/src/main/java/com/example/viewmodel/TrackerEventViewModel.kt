@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 class TrackerEventViewModel(
@@ -32,8 +33,15 @@ class TrackerEventViewModel(
                 delay(60_000)
             }
         }
-        return combine(repository.getEventsForChild(childId), childRepository.getChild(childId), ticker) { events, child, _ ->
-            TrackerAnalytics.compute(events, child, System.currentTimeMillis())
+        val data = combine(repository.getEventsForChild(childId), childRepository.getChild(childId)) { events, child ->
+            events to child
+        }
+        // The learned part (signal coefficients, back-test) only changes with the data.
+        val learned = data.map { (events, child) ->
+            Triple(events, child, TrackerAnalytics.learn(events, child, System.currentTimeMillis()))
+        }
+        return combine(learned, ticker) { (events, child, learnedPart), _ ->
+            TrackerAnalytics.compute(events, child, System.currentTimeMillis(), learned = learnedPart)
         }.flowOn(Dispatchers.Default)
     }
 

@@ -242,7 +242,7 @@ class InteroceptionMetricsTest {
             val earlyLevel = if (childInformative) "ничего" else InteroceptionMetrics.LEVELS[rnd.nextInt(4)]
             // Model is mediocre: ~0.5 everywhere with noise.
             events.add(event(t + 20 * MIN, EventTypes.SENSATION, earlyLevel, p = (0.4 + rnd.nextDouble() * 0.3).toFloat()))
-            events.add(event(next - 15 * MIN, EventTypes.SENSATION, lateLevel, p = (0.4 + rnd.nextDouble() * 0.3).toFloat()))
+            events.add(event(next - 3 * MIN, EventTypes.SENSATION, lateLevel, p = (0.4 + rnd.nextDouble() * 0.3).toFloat()))
             t = next
         }
         return events
@@ -259,7 +259,7 @@ class InteroceptionMetricsTest {
         assertEquals(InteroceptionMetrics.Phase.C_CHILD_BETTER, r.comparison.phase)
         assertTrue(r.sensationFillCorrelation!! > 0.9)
         val strong = r.levels.first { it.level == "сильно" }
-        assertEquals(150.0 * (105.0 / 120.0) / 200.0 * 100.0, strong.medianFillPct!!, 1e-6)
+        assertEquals(150.0 * (117.0 / 120.0) / 200.0 * 100.0, strong.medianFillPct!!, 1e-6)
         assertNotNull(r.monthly.firstOrNull())
     }
 
@@ -275,7 +275,7 @@ class InteroceptionMetricsTest {
 
     @Test
     fun tooFewReports_isInsufficient() {
-        val events = listOf(pee(0), event(100 * MIN, EventTypes.SENSATION, "сильно", p = 0.5f), pee(110 * MIN))
+        val events = listOf(pee(0), event(100 * MIN, EventTypes.SENSATION, "сильно", p = 0.5f), pee(103 * MIN))
         val ex = IntervalExtractor.extract(events, null, 5 * HOUR, UTC)
         val r = InteroceptionMetrics.compute(events, ex, 200.0, 5 * HOUR, UTC)
         assertEquals(InteroceptionMetrics.Phase.INSUFFICIENT_DATA, r.comparison.phase)
@@ -296,10 +296,10 @@ class TrackerAnalyticsTest {
         val snap = TrackerAnalytics.compute(events, child, now, UTC)
 
         assertEquals(120.0, snap.model.medianIntervalMillis / 60_000.0, 3.0)
-        assertTrue(snap.model.probNext30 < 0.05f) // only 60 min since last void
-        assertTrue(snap.calibration.n > 100)
-        assertTrue("Brier ${snap.calibration.brier}", snap.calibration.brier!! < 0.1)
-        assertTrue(snap.calibration.skill!! > 0.5)
+        assertTrue(snap.probNext5 < 0.01f) // only 60 min since last void, no signals
+        assertTrue(snap.calibration.n > 500)
+        assertTrue("Brier ${snap.calibration.brier}", snap.calibration.brier!! < 0.05)
+        assertTrue("skill ${snap.calibration.skill}", snap.calibration.skill!! > 0.3)
         assertTrue(!snap.isAsleepNow)
         assertEquals(140.0, snap.bladder.personalCapacityMl, 15.0)
         assertTrue(snap.ageMonths!! > 0)
@@ -317,5 +317,70 @@ class TrackerAnalyticsTest {
     fun ageParsing() {
         assertNull(TrackerAnalytics.ageMonths("bad", 0L, UTC))
         assertEquals(12.0, TrackerAnalytics.ageMonths("1970-01-01", (365.25 * DAY).toLong(), UTC)!!, 0.01)
+    }
+}
+
+class SignalModelTest {
+    private fun holdEvent(ts: Long, sensation: String, holding: Int) = TrackerEvent(
+        childId = "c", timestamp = ts, eventType = EventTypes.SENSATION, sensationLevel = sensation, holdingLevel = holding
+    )
+
+    /** Irregular child (intervals 60–180 min); parent notes "сильно"+holding 3 minutes before each void. */
+    private fun dataset(withSignals: Boolean): List<TrackerEvent> {
+        val rnd = Random(11)
+        val events = mutableListOf<TrackerEvent>()
+        var t = 0L
+        repeat(150) {
+            events.add(pee(t, 120))
+            val len = ((60 + rnd.nextInt(121)) * MIN)
+            if (withSignals) {
+                events.add(holdEvent(t + 20 * MIN, "ничего", 0))
+                events.add(holdEvent(t + len - 3 * MIN, "сильно", 3))
+            }
+            t += len
+        }
+        events.add(pee(t, 120))
+        return events
+    }
+
+    @Test
+    fun timingAlone_cannotBeSharpOverFiveMinutes() {
+        val events = dataset(withSignals = false)
+        val now = events.maxOf { it.timestamp } + 1
+        val ex = IntervalExtractor.extract(events, null, now, UTC)
+        val post = BayesianSurvivalModel.fit(BayesianSurvivalModel.observationsFrom(ex.intervals), 30.0)
+        val pred = post.predictive(BayesianSurvivalModel.Features())
+        val maxP5 = (0..240 step 5).maxOf { pred.conditionalProbability(it.toDouble(), 5.0) }
+        assertTrue("max 5-min probability from timing alone: $maxP5", maxP5 < 0.35)
+    }
+
+    @Test
+    fun learnsSignals_andBeatsTimingOnly() {
+        val withSig = dataset(withSignals = true)
+        val now = withSig.maxOf { it.timestamp } + 1
+        val learned = TrackerAnalytics.learn(withSig, null, now, UTC)
+        assertTrue("γ holding ${learned.signal.holding}", learned.signal.holding > 0.8)
+
+        val timingOnly = TrackerAnalytics.learn(dataset(withSignals = false), null, now, UTC)
+        val bSig = learned.calibration.brier!!
+        val bTime = timingOnly.calibration.brier!!
+        assertTrue("Brier with signals $bSig vs timing only $bTime", bSig < 0.6 * bTime)
+
+        // A strong report right now pushes the 5-minute probability over the alert threshold.
+        val lastVoid = withSig.filter { it.eventType == EventTypes.PEE }.maxOf { it.timestamp }
+        val nowLater = lastVoid + 100 * MIN
+        val live = withSig + holdEvent(nowLater - MIN, "сильно", 3)
+        val snap = TrackerAnalytics.compute(live, null, nowLater, UTC, learned)
+        assertTrue("p5 ${snap.probNext5}", snap.probNext5 >= TrackerAnalytics.COMMAND_THRESHOLD)
+        val quiet = TrackerAnalytics.compute(withSig, null, nowLater, UTC, learned)
+        assertTrue("quiet p5 ${quiet.probNext5}", quiet.probNext5 < 0.2f)
+    }
+
+    @Test
+    fun signalWindowExpires() {
+        val reports = listOf(holdEvent(10 * MIN, "сильно", 2))
+        assertEquals(SignalModel.Signal(3, 2), SignalModel.signalAt(reports, 0, 20 * MIN))
+        assertEquals(SignalModel.Signal.NONE, SignalModel.signalAt(reports, 0, 40 * MIN))
+        assertEquals(SignalModel.Signal.NONE, SignalModel.signalAt(reports, 15 * MIN, 20 * MIN)) // before last void
     }
 }

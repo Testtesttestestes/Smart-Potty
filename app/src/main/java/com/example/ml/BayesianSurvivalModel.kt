@@ -17,7 +17,7 @@ import kotlin.math.sqrt
 object BayesianSurvivalModel {
 
     /** Bump when the meaning of stored probabilities changes (stored in TrackerEvent.modelVersion). */
-    const val MODEL_VERSION = 2
+    const val MODEL_VERSION = 3 // 3: stored probabilities are P(void in next 5 min) incl. signals
 
     // Prior on the noise variance σ² ~ InvGamma(A0, B0): E[σ²] = 0.15 (σ ≈ 0.4 → typical spread ≈ ×1.5),
     // worth only 2·A0 = 4 pseudo-observations so the child's own regularity takes over quickly.
@@ -127,6 +127,7 @@ object BayesianSurvivalModel {
         val interval80Millis: Pair<Long, Long>,
         /** Unconditional F(elapsed) — legacy meaning of the old `probabilityNow`. */
         val cumulativeProbability: Float,
+        val probNext5: Float,
         val probNext15: Float,
         val probNext30: Float,
         val probNext60: Float,
@@ -135,8 +136,6 @@ object BayesianSurvivalModel {
         val effectiveN: Double,
         val hasLastVoid: Boolean
     ) {
-        /** Probability used for alerts and stored with events. */
-        val probabilityNow: Float get() = probNext30
     }
 
     fun analyze(
@@ -156,6 +155,7 @@ object BayesianSurvivalModel {
             medianIntervalMillis = ms(pred.medianMinutes()),
             interval80Millis = ms(pred.quantileMinutes(0.1)) to ms(pred.quantileMinutes(0.9)),
             cumulativeProbability = (elapsedMin?.let { pred.cdfMinutes(it) } ?: 0.0).toFloat(),
+            probNext5 = (elapsedMin?.let { pred.conditionalProbability(it, 5.0) } ?: 0.0).toFloat(),
             probNext15 = (elapsedMin?.let { pred.conditionalProbability(it, 15.0) } ?: 0.0).toFloat(),
             probNext30 = (elapsedMin?.let { pred.conditionalProbability(it, 30.0) } ?: 0.0).toFloat(),
             probNext60 = (elapsedMin?.let { pred.conditionalProbability(it, 60.0) } ?: 0.0).toFloat(),

@@ -20,6 +20,7 @@ import com.example.data.TrackerEvent
 import com.example.ml.BayesianSurvivalModel
 import com.example.ml.BladderModel
 import com.example.ml.InteroceptionMetrics
+import com.example.ml.SignalModel
 import com.example.ml.TrackerAnalytics
 import kotlin.math.roundToInt
 import com.example.viewmodel.TrackerEventViewModel
@@ -48,7 +49,7 @@ fun TrackerScreen(
 
     val analytics by remember(childId) { viewModel.analyticsForChild(childId) }
         .collectAsStateWithLifecycle(initialValue = null)
-    val currentProbability = analytics?.model?.probNext30 ?: 0f
+    val currentProbability = analytics?.probNext5 ?: 0f
 
     // Every saved event gets the current capacity estimate (pee) and the model version of any stored probability.
     fun save(event: TrackerEvent) {
@@ -234,7 +235,7 @@ fun TrackerScreen(
                     
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Вероятность позыва в ближайшие 30 минут ≥${(TrackerAnalytics.COMMAND_THRESHOLD * 100).toInt()}% (с учётом того, что позыва ещё не было) запускает приказ «Потерпи еще немного». Во время сна приказ не срабатывает.",
+                        text = "Вероятность позыва в ближайшие 5 минут ≥${(TrackerAnalytics.COMMAND_THRESHOLD * 100).toInt()}% (время + свежие ощущения и поведение удержания) запускает приказ «Потерпи еще немного». Во время сна приказ не срабатывает.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
                     )
@@ -398,7 +399,7 @@ fun TrackerScreen(
                     )
                     
                     Text(
-                        text = "Вероятность позыва в ближайшие 30 минут — ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
+                        text = "Вероятность позыва в ближайшие 5 минут — ${(currentProbability * 100).toInt()}%. Горшок дает приказ:\n\n«ПОТЕРПИ ЕЩЕ НЕМНОГО»",
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onErrorContainer,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -879,7 +880,7 @@ fun ForecastCard(snapshot: TrackerAnalytics.Snapshot) {
                     if (snapshot.isAsleepNow) {
                         Text("Спит", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Bold)
                     } else if (m.hasLastVoid) {
-                        Text("В ближайшие 30 мин: ${pct(m.probNext30.toDouble())}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text("В ближайшие 5 мин: ${pct(snapshot.probNext5.toDouble())}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     }
                     Text("Уверенность: ${pct(m.confidence.toDouble())}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
                 }
@@ -890,7 +891,7 @@ fun ForecastCard(snapshot: TrackerAnalytics.Snapshot) {
             )
             if (m.hasLastVoid && !snapshot.isAsleepNow) {
                 Text(
-                    "15 мин: ${pct(m.probNext15.toDouble())} · 60 мин: ${pct(m.probNext60.toDouble())}" +
+                    "Только по времени: 5 мин ${pct(m.probNext5.toDouble())} · 30 мин ${pct(m.probNext30.toDouble())} · 60 мин ${pct(m.probNext60.toDouble())}" +
                         (m.medianTimeLeftMillis?.let { " · осталось ≈ ${formatInterval(it)}" } ?: ""),
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -900,6 +901,20 @@ fun ForecastCard(snapshot: TrackerAnalytics.Snapshot) {
                     (b.currentFill?.let { " · наполнен ≈ ${pct(it.coerceAtMost(1.5))}" } ?: ""),
                 style = MaterialTheme.typography.bodySmall
             )
+            val sig = snapshot.currentSignal
+            if (sig != SignalModel.Signal.NONE) {
+                Text(
+                    "Сейчас: ощущение «${InteroceptionMetrics.LEVELS[sig.sensation]}», удержание ${sig.holding}/3 → шансы ×${"%.1f".format(kotlin.math.exp(snapshot.signalCoefficients.logOdds(sig)))}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            } else if (m.hasLastVoid && !snapshot.isAsleepNow) {
+                Text(
+                    "Для точного 5-минутного прогноза отмечайте ощущения и удержание",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             val cal = snapshot.calibration
             Text(
                 if (cal.n < 10 || cal.brier == null) "Проверка точности на истории: мало данных (дневных интервалов: ${snapshot.dayIntervalCount})"
